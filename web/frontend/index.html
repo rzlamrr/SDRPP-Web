@@ -1,33 +1,55 @@
 <!doctype html>
-<html lang="en">
+<html lang="en" data-theme="dark">
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>RF Monitor</title>
-    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Cpath d='M2 26 L9 26 L12 10 L16 22 L20 6 L24 26 L30 26' fill='none' stroke='%2300a0ff' stroke-width='3' stroke-linejoin='round' stroke-linecap='round'/%3E%3C/svg%3E" />
+    <title>RF Sentinel</title>
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%234da3ff' stroke-width='2' stroke-linecap='round'%3E%3Ccircle cx='12' cy='12' r='9'/%3E%3Ccircle cx='12' cy='12' r='5'/%3E%3Cpath d='M12 12 19 5'/%3E%3C/svg%3E" />
+    <script>
+      try {
+        if (localStorage.getItem("sentinel.appearance") === "light") document.documentElement.dataset.theme = "light";
+      } catch {}
+    </script>
   </head>
   <body>
     <div id="app">
-      <div id="topbar">
-        <button id="menuBtn" class="icon-btn" title="Show or hide the menu"><img src="res/icons/menu.png" alt="Menu" /></button>
-        <button id="playBtn" class="icon-btn" title="Start or stop the radios"><img id="playIcon" src="res/icons/play.png" alt="Start" /></button>
-        <div id="freqSelect"></div>
-        <div id="bandLabel"></div>
-        <div id="topSpacer"></div>
-        <div id="alerts" hidden title="Active interference. Click to show the first one."></div>
-        <div id="snr" title="Signal to noise ratio of the selected band"><canvas id="snrCanvas"></canvas></div>
-      </div>
+      <header id="topbar">
+        <div id="brand"><span id="brandIcon"></span><span>RF Sentinel</span></div>
+        <span id="statusPill" class="pill"></span>
+        <span id="summary" class="muted"></span>
+        <div class="spacer"></div>
+        <button id="alertBtn" class="pill-btn" title="Active interference. Click to show the most severe one."></button>
+        <button id="runBtn" class="btn primary" title="Start or stop the radios (Space)"></button>
+        <button id="themeBtn" class="btn icon" title="Switch between dark and light"></button>
+        <button id="settingsBtn" class="btn icon" title="Settings"></button>
+      </header>
       <div id="error" hidden></div>
-      <div id="main">
-        <div id="menu"></div>
-        <div id="menuResize"></div>
-        <div id="panes"></div>
-        <div id="controls">
-          <div class="vctl"><div class="vlabel">Zoom</div><div id="zoomSlider" class="vslider"></div></div>
-          <div class="vctl"><div class="vlabel">Max</div><div id="maxSlider" class="vslider"></div></div>
-          <div class="vctl"><div class="vlabel">Min</div><div id="minSlider" class="vslider"></div></div>
+      <div id="toolbar">
+        <div class="tool"><span class="tool-label">Layout</span><div id="layoutSeg"></div></div>
+        <div class="tool"><span class="tool-label">Trace</span><div id="modeSeg"></div></div>
+        <div class="tool" id="waterfallTool"></div>
+        <div class="tool levels-tool">
+          <button id="autoLevelBtn" class="btn small" title="Fit the level range to what the radios receive now">Auto level</button>
+          <button id="levelsBtn" class="btn small icon" title="Set the level range by hand"></button>
+          <div id="levelsPop" class="popover" hidden></div>
         </div>
+        <div class="spacer"></div>
+        <div class="tool center-tool" title="Center frequency of the selected band. Click the top or bottom half of a digit, or scroll over it.">
+          <span class="tool-label" id="centerLabel">Center</span>
+          <div id="freqSelect"></div>
+        </div>
+        <button id="addBandBtn" class="btn small" title="Add a band"></button>
       </div>
+      <div id="main">
+        <div id="wall"></div>
+        <aside id="alerts"></aside>
+      </div>
+      <div id="timelineBox">
+        <button id="timelineToggle" class="timeline-head" type="button" title="Collapse or expand the timeline (T)"><span id="timelineChevron"></span><span>Event timeline · last 60 min</span><span id="timelineSummary" class="muted"></span></button>
+        <canvas id="timeline"></canvas>
+      </div>
+      <div id="drawerScrim" hidden></div>
+      <aside id="drawer" hidden></aside>
       <div id="notices"></div>
     </div>
     <script type="module" src="/src/main.ts"></script>

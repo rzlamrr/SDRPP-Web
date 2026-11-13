@@ -1,22 +1,29 @@
-// SDR++ web monitor: the main window of SDR++ (gui/main_window.cpp) with one waterfall per band.
+// RF Sentinel: multi-band RF interference monitor. Every band is shown live on the band wall, with the
+// alert feed beside it and the event timeline underneath. Data comes from `sdrpp --web` (web/src).
 
 import "./style.css";
 import * as api from "./api";
-import type { Interference, Menu, State } from "./api";
+import type { Interference, InterferenceEvent, Menu, State } from "./api";
+import { AlertFeed } from "./alertfeed";
 import { FreqSelect } from "./freqselect";
-import { InterferenceMenu, hz, typeInfo } from "./interference";
-import { Pane, type PaneSettings } from "./pane";
-import { renderMenu } from "./smgui";
+import { ICONS } from "./icons";
+import { typeInfo, hz } from "./interference";
+import type { PaneSettings } from "./pane";
+import { SettingsDrawer } from "./settings";
+import { bandHealth, sortEvents } from "./status";
 import { Stream } from "./stream";
-import { buildPalette, loadColorMap, loadTheme } from "./theme";
-import { button, checkbox, collapsingHeader, combo, el, inputInt, inputText, latest, leftLabel, radio, row, vslider } from "./widgets";
+import { buildPalette, getAppearance, loadColorMap, setAppearance } from "./theme";
+import { Timeline } from "./timeline";
+import { LAYOUTS, Wall } from "./wall";
+import { el, latest, leftLabel, segmented, setIcon, slider, toggle } from "./widgets";
 
 const $ = <T extends HTMLElement>(id: string) => document.getElementById(id) as T;
 
 function stored(key: string, fallback: number): number {
   try {
-    const value = Number(localStorage.getItem(key));
-    return Number.isFinite(value) && value > 0 ? value : fallback;
+    const raw = localStorage.getItem(key);
+    const value = raw === null ? NaN : Number(raw);
+    return Number.isFinite(value) ? value : fallback;
   } catch {
     return fallback;
   }
@@ -30,20 +37,23 @@ function store(key: string, value: number) {
   }
 }
 
+setAppearance(getAppearance());
+
 let state: State;
 let interference: Interference | null = null;
-let selected = stored("sdrpp.selectedBand", 0);
+let menus: Menu[] = [];
+let selected = stored("sentinel.selectedBand", -1);
 let connected = true;
 let actionError = "";
 let colorMapAuthor = "";
-const panes = new Map<number, Pane>();
+let runningSince = 0;
 const stream = new Stream();
 
 const settings: PaneSettings = {
   min: -120,
   max: 0,
   showWaterfall: true,
-  fftHeight: stored("sdrpp.fftHeight", 300),
+  fftRatio: stored("sentinel.fftRatio", 0.5),
   palette: buildPalette(["#000020", "#FFFFFF"]),
   running: false,
   dwellMs: 100,
@@ -52,280 +62,218 @@ const settings: PaneSettings = {
   persistenceSpeed: 20,
 };
 
-// --- top bar -----------------------------------------------------------------------------
+// --- band wall ------------------------------------------------------------------------------
 
-const freqSelect = new FreqSelect($("freqSelect"));
 const sendFrequency = latest((v: { id: number; frequency: number }) => run(() => api.updateBand(v.id, { frequency: v.frequency })));
 
+const wall = new Wall($("wall"), settings, {
+  onSelect: selectBand,
+  onView: (id, offset, bandwidth, points) => stream.setView(id, offset, bandwidth, points),
+  onTune: (id, frequency) => {
+    if (id === selected) freqSelect.set(frequency);
+    sendFrequency({ id, frequency });
+  },
+  onFftRatio: (ratio) => {
+    settings.fftRatio = Math.min(Math.max(ratio, 0.2), 0.8);
+    store("sentinel.fftRatio", settings.fftRatio);
+    wall.panes.forEach((p) => p.settingsChanged());
+  },
+  onLayout: (layout) => layoutSeg.set(LAYOUTS.indexOf(layout)),
+  onAddBand: addBand,
+  onOpenSettings: () => drawer.open("Radios"),
+});
+
+function selectBand(id: number) {
+  selected = id;
+  store("sentinel.selectedBand", id);
+  wall.panes.forEach((p, bandId) => p.root.classList.toggle("selected", bandId === id && wall.panes.size > 1));
+  const band = state?.bands.find((b) => b.id === id);
+  freqSelect.set(band ? band.frequency : 0);
+  $("freqSelect").classList.toggle("disabled", !band);
+  $("centerLabel").textContent = band ? `${band.name} center` : "Center";
+}
+
+function addBand() {
+  const base = state?.bands.find((b) => b.id === selected) ?? state?.bands[state.bands.length - 1];
+  run(() => api.addBand({ frequency: base ? base.frequency : 100e6 }));
+}
+
+// --- top bar ----------------------------------------------------------------------------------
+
+$("brandIcon").innerHTML = ICONS.logo;
+setIcon($("settingsBtn"), "settings");
+$("runBtn").addEventListener("click", toggleRunning);
+$("settingsBtn").addEventListener("click", () => (drawer.isOpen ? drawer.close() : drawer.open()));
+$("themeBtn").addEventListener("click", () => {
+  applyAppearance(getAppearance() === "dark" ? "light" : "dark");
+});
+$("alertBtn").addEventListener("click", showWorstAlert);
+
+function toggleRunning() {
+  if (state) run(() => (state.running ? api.stop() : api.start()));
+}
+
+function applyAppearance(a: "dark" | "light") {
+  setAppearance(a);
+  renderThemeButton();
+  wall.panes.forEach((p) => p.queueDraw());
+  timeline.draw();
+  drawer.refresh();
+}
+
+function renderThemeButton() {
+  const dark = getAppearance() === "dark";
+  setIcon($("themeBtn"), dark ? "sun" : "moon");
+  $("themeBtn").title = dark ? "Switch to the light appearance" : "Switch to the dark appearance";
+}
+renderThemeButton();
+
+function clockText(ms: number) {
+  const s = Math.floor(ms / 1000);
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  return `${h}:${String(m).padStart(2, "0")}:${String(s % 60).padStart(2, "0")}`;
+}
+
+function renderTopBar() {
+  const pill = $("statusPill");
+  const learning = !!interference?.settings.enabled && !!interference?.bands.some((b) => b.learning) && state?.running;
+  let cls: string;
+  let text: string;
+  if (!connected) [cls, text] = ["bad", "Monitor offline"];
+  else if (!state) [cls, text] = ["idle", "Connecting…"];
+  else if (!state.running) [cls, text] = ["idle", "Stopped"];
+  else if (!state.radios.some((r) => r.online)) [cls, text] = ["bad", "No radio"];
+  else if (learning) [cls, text] = ["learn", "Learning baseline"];
+  else [cls, text] = ["ok", "Monitoring"];
+  pill.className = `pill ${cls}`;
+  pill.textContent = text;
+
+  if (state) {
+    const online = state.radios.filter((r) => r.online).length;
+    const parts = [`${online}/${state.radios.length} radio${state.radios.length === 1 ? "" : "s"}`, `${state.bands.length} band${state.bands.length === 1 ? "" : "s"}`];
+    if (state.running && runningSince) parts.push(`running ${clockText(Date.now() - runningSince)}`);
+    $("summary").textContent = parts.join(" · ");
+  }
+
+  const alertBtn = $("alertBtn");
+  const n = interference?.active.length ?? 0;
+  if (n > 0 && interference) {
+    alertBtn.className = "pill-btn bad";
+    const worst = sortEvents(interference.active, interference.settings)[0];
+    setIcon(alertBtn, "alert", `${n} active · ${typeInfo(worst.type).label}${worst.type === "noise" ? "" : ` ${hz(worst.center)}`}`);
+    alertBtn.title = "Show the most severe interference (A)";
+  } else {
+    alertBtn.className = "pill-btn ok";
+    setIcon(alertBtn, "check", "No active alerts");
+    alertBtn.title = "";
+  }
+
+  const runBtn = $("runBtn");
+  const running = !!state?.running;
+  runBtn.className = `btn primary${running ? " stop" : ""}`;
+  setIcon(runBtn, running ? "stop" : "play", running ? "Stop" : "Start");
+}
+
+// --- toolbar --------------------------------------------------------------------------------
+
+const layoutSeg = segmented(["Grid", "Stack"], LAYOUTS.indexOf(wall.layout), (i) => wall.setLayout(LAYOUTS[i]), [
+  "Main band on top, the others two per row below it (G)",
+  "One full-width row per band (S)",
+]);
+$("layoutSeg").append(layoutSeg.root);
+
+const modeSeg = segmented(["Line", "Persistence"], 0, (i) => run(() => api.setDisplay({ fftMode: i === 1 ? "persistence" : "line" })), [
+  "Latest spectrum as a line",
+  "How often each level occurs: shows signals that come and go",
+]);
+$("modeSeg").append(modeSeg.root);
+
+const waterfallToggle = toggle("Waterfall", true, (v) => run(() => api.setDisplay({ showWaterfall: v })));
+$("waterfallTool").append(waterfallToggle.root);
+
+const sendLevels = latest((v: { min: number; max: number }) => run(() => api.setDisplay(v), false));
+
+function setLevels(min: number, max: number) {
+  settings.min = Math.round(min);
+  settings.max = Math.round(max);
+  if (state) {
+    state.display.min = settings.min;
+    state.display.max = settings.max;
+  }
+  wall.panes.forEach((p) => p.settingsChanged());
+  sendLevels({ min: settings.min, max: settings.max });
+  renderLevels();
+}
+
+// Fits the level range to the spectra on screen: noise floor near the bottom, strongest signal near the top
+$("autoLevelBtn").addEventListener("click", () => {
+  const values: number[] = [];
+  wall.panes.forEach((p) => {
+    const data = p.latestLevels();
+    if (!data) return;
+    const step = Math.max(1, Math.floor(data.length / 512));
+    for (let i = 0; i < data.length; i += step) if (Number.isFinite(data[i])) values.push(data[i]);
+  });
+  if (values.length < 10) {
+    actionError = "Auto level needs a spectrum. Press Start first.";
+    showError();
+    return;
+  }
+  values.sort((a, b) => a - b);
+  const floor = values[Math.floor(values.length * 0.05)];
+  const peak = values[values.length - 1];
+  const min = Math.max(Math.floor((floor - 10) / 5) * 5, -160);
+  const max = Math.min(Math.max(Math.ceil((peak + 10) / 5) * 5, min + 20), 0);
+  setLevels(min, max);
+});
+
+setIcon($("levelsBtn"), "levels");
+$("levelsBtn").addEventListener("click", (ev) => {
+  ev.stopPropagation();
+  const pop = $("levelsPop");
+  pop.hidden = !pop.hidden;
+  if (!pop.hidden) renderLevels();
+});
+document.addEventListener("pointerdown", (ev) => {
+  const pop = $("levelsPop");
+  if (!pop.hidden && !pop.contains(ev.target as Node) && ev.target !== $("levelsBtn")) pop.hidden = true;
+});
+
+function renderLevels() {
+  const pop = $("levelsPop");
+  if (pop.hidden) return;
+  const max = slider({ min: -150, max: 0, value: settings.max, step: 1, format: (v) => `${Math.round(v)} dB`, onChange: (v) => setLevels(Math.min(settings.min, v - 1), v) });
+  const min = slider({ min: -160, max: -10, value: settings.min, step: 1, format: (v) => `${Math.round(v)} dB`, onChange: (v) => setLevels(v, Math.max(settings.max, v + 1)) });
+  pop.replaceChildren(el("div", "tool-label", "Level range of every spectrum and waterfall"), leftLabel("Top", max), leftLabel("Bottom", min));
+  pop.querySelectorAll<HTMLElement>(".im-left-label").forEach((l) => (l.style.width = "60px"));
+}
+
+const freqSelect = new FreqSelect($("freqSelect"));
 freqSelect.onChange = (frequency) => {
-  const pane = panes.get(selected);
+  const pane = wall.panes.get(selected);
   if (!pane) return;
   pane.setBand({ ...pane.band, frequency });
   sendFrequency({ id: selected, frequency });
 };
 
-$("menuBtn").addEventListener("click", () => {
-  const hidden = document.body.classList.toggle("menu-hidden");
-  store("sdrpp.menuHidden", hidden ? 1 : 2);
-});
-if (stored("sdrpp.menuHidden", 2) === 1) document.body.classList.add("menu-hidden");
+setIcon($("addBandBtn"), "plus", "Add band");
+$("addBandBtn").addEventListener("click", addBand);
 
-$("playBtn").addEventListener("click", () => run(() => (state.running ? api.stop() : api.start())));
+// --- alerts and timeline --------------------------------------------------------------------
 
-function drawSnr() {
-  const canvas = $<HTMLCanvasElement>("snrCanvas");
-  const dpr = window.devicePixelRatio || 1;
-  const width = canvas.clientWidth;
-  const height = canvas.clientHeight;
-  if (canvas.width !== Math.round(width * dpr)) {
-    canvas.width = Math.round(width * dpr);
-    canvas.height = Math.round(height * dpr);
-  }
-  const ctx = canvas.getContext("2d")!;
-  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-  ctx.clearRect(0, 0, width, height);
-  const css = getComputedStyle(document.documentElement);
-  const text = css.getPropertyValue("--Text") || "#fff";
-
-  // Same scale as the SNR meter of SDR++: 0 to 100 dB with a mark every 10
-  const pane = panes.get(selected);
-  const snr = state?.running && pane?.latest && !pane.stale ? pane.latest.snr : 0;
-  const scale = (width - 20) / 100;
-  ctx.fillStyle = "rgb(0, 136, 255)";
-  ctx.fillRect(10, 6, Math.min(Math.max(snr, 0), 100) * scale, 8);
-  ctx.strokeStyle = text;
-  ctx.fillStyle = text;
-  ctx.font = "11px Roboto, sans-serif";
-  ctx.textAlign = "center";
-  ctx.textBaseline = "top";
-  ctx.beginPath();
-  ctx.moveTo(10, 16.5);
-  ctx.lineTo(width - 10, 16.5);
-  for (let db = 0; db <= 100; db += 10) {
-    const x = Math.round(10 + db * scale) + 0.5;
-    ctx.moveTo(x, 16);
-    ctx.lineTo(x, 21);
-    ctx.fillText(String(db), x, 23);
-  }
-  ctx.stroke();
-}
-
-// --- waterfall controls (right strip) ------------------------------------------------------
-
-const sendLevels = latest((v: { min: number; max: number }) => run(() => api.setDisplay(v), false));
-
-const zoomSlider = vslider($("zoomSlider"), 1, 0, 1, (v) => {
-  const pane = panes.get(selected);
+function focusEvent(e: InterferenceEvent) {
+  const pane = wall.panes.get(e.band);
   if (!pane) return;
-  // Same curve as the Zoom slider in MainWindow::draw
-  const bw = pane.band.sampleRate || 1;
-  pane.setViewBandwidth(Math.min(1000 + v * v * (bw - 1000), bw));
-});
-const maxSlider = vslider($("maxSlider"), 0, -160, 0, (v) => {
-  settings.max = Math.round(v);
-  if (settings.max <= settings.min) {
-    settings.min = settings.max - 1;
-    minSlider.set(settings.min);
-  }
-  levelsChanged();
-});
-const minSlider = vslider($("minSlider"), 0, -160, -120, (v) => {
-  settings.min = Math.round(v);
-  if (settings.min >= settings.max) {
-    settings.max = settings.min + 1;
-    maxSlider.set(settings.max);
-  }
-  levelsChanged();
-});
-
-function levelsChanged() {
-  state.display.min = settings.min;
-  state.display.max = settings.max;
-  panes.forEach((p) => p.settingsChanged());
-  sendLevels({ min: settings.min, max: settings.max });
+  selectBand(e.band);
+  wall.reveal(e.band);
+  pane.focusRange(e.low, e.high, e.type === "noise");
 }
 
-function syncZoomSlider() {
-  const pane = panes.get(selected);
-  if (!pane) return;
-  const bw = pane.band.sampleRate || 1;
-  const view = pane.viewFraction * bw;
-  zoomSlider.set(bw <= 1000 ? 1 : Math.sqrt(Math.min(Math.max((view - 1000) / (bw - 1000), 0), 1)));
-}
-
-// --- menu ----------------------------------------------------------------------------------
-
-const menuHost = $("menu");
-const sourceSection = collapsingHeader("Source");
-const bandsSection = collapsingHeader("Bands");
-const interferenceSection = collapsingHeader("Interference");
-const displaySection = collapsingHeader("Display");
-const themeSection = collapsingHeader("Theme", false);
-menuHost.append(sourceSection.root, bandsSection.root, interferenceSection.root, displaySection.root, themeSection.root);
-
-const sourceTypeHost = el("div");
-const radiosHost = el("div");
-const radioButtonsHost = el("div");
-sourceSection.body.append(sourceTypeHost, radiosHost, radioButtonsHost);
-
-let menus: Menu[] = [];
-const radioHosts: HTMLDivElement[] = [];
-let menuPointerDown = false;
-let menuPending = false;
-radiosHost.addEventListener("pointerdown", () => (menuPointerDown = true));
-window.addEventListener("pointerup", () => {
-  menuPointerDown = false;
-  if (menuPending) renderRadios();
-});
-
-function renderSourceType() {
-  const names = state.sourceTypes.map((t) => t.name);
-  const index = state.sourceTypes.findIndex((t) => t.id === state.sourceType);
-  const select = combo(names, index, (i) => run(() => api.setSetup({ sourceType: state.sourceTypes[i].id })));
-  select.classList.add("im-fill");
-  // Like SDR++, the source can only be changed while stopped
-  if (state.running) select.classList.add("im-disabled");
-  sourceTypeHost.replaceChildren(row(select));
-}
-
-// Each radio is one more instance of the source module. The server refuses a count it does not support.
-function renderRadioButtons() {
-  const add = button("Add Radio", () => run(() => api.setSetup({ radioCount: state.radioCount + 1 })));
-  add.title = "Use one more radio of this type";
-  const remove = button("Remove Radio", () => run(() => api.setSetup({ radioCount: state.radioCount - 1 })));
-  remove.title = "Stop using the last radio";
-  if (state.radioCount <= 1) remove.classList.add("im-disabled");
-  add.classList.add("im-fill");
-  remove.classList.add("im-fill");
-  radioButtonsHost.replaceChildren(row(add, remove));
-}
-
-function renderRadios() {
-  // Replacing a slider while it is being dragged would drop the drag
-  if (menuPointerDown) {
-    menuPending = true;
-    return;
-  }
-  menuPending = false;
-  radiosHost.replaceChildren();
-  radioHosts.length = 0;
-  menus.forEach((menu, i) => {
-    const radioState = state.radios[i];
-    const offline = radioState && !radioState.online;
-    if (menus.length > 1 || offline) {
-      const names = (radioState?.bands ?? []).map((id) => state.bands.find((b) => b.id === id)?.name ?? `#${id}`);
-      const what = offline ? " (no device connected)" : names.length ? `: ${names.join(", ")}` : " (no band)";
-      radiosHost.append(el("div", "im-separator-text", `Radio ${i + 1}${what}`));
-    }
-    const host = el("div", "radio-menu");
-    renderMenu(host, menu, (action) =>
-      sendMenuAction({ radio: i, action }),
-    );
-    radiosHost.append(host);
-    radioHosts.push(host);
-  });
-  if (menus.length === 0) radiosHost.append(el("div", "im-text im-disabled-text", "No radio available"));
-}
-
-const sendMenuAction = latest(async (v: { radio: number; action: api.MenuAction }) => {
-  await run(async () => {
-    menus[v.radio] = await api.menuAction(v.radio, v.action);
-    renderRadios();
-    // A device or sample rate change shows up in the state
-    return api.getState();
-  });
-});
-
-async function refreshMenus() {
-  try {
-    menus = await Promise.all(state.radios.map((r) => api.getMenu(r.id)));
-  } catch {
-    menus = [];
-  }
-  renderRadios();
-}
-
-function renderBands() {
-  const body = bandsSection.body;
-  body.replaceChildren();
-  body.append(
-    leftLabel("Dwell (ms)", inputInt(state.dwellMs, 10, (v) => run(() => api.setSetup({ dwellMs: v })))),
-    leftLabel("Settle (ms)", inputInt(state.settleMs, 5, (v) => run(() => api.setSetup({ settleMs: v })))),
-  );
-  for (const band of state.bands) {
-    const select = radio("", band.id === selected, () => selectBand(band.id));
-    const name = inputText(band.name, (v) => run(() => api.updateBand(band.id, { name: v })));
-    name.classList.add("im-fill");
-    const radioName = band.radio >= 0 ? `R${band.radio + 1}` : "-";
-    let tag: HTMLElement;
-    if (state.radios.length > 1) {
-      // The first entry leaves the choice to the monitor and shows the radio it picked
-      const tied = band.radioSetting >= 0;
-      const items = [tied ? "Auto" : `Auto (${radioName})`, ...state.radios.map((r) => `R${r.id + 1}${r.online ? "" : " (offline)"}`)];
-      tag = combo(items, tied ? band.radioSetting + 1 : 0, (i) => run(() => api.updateBand(band.id, { radioSetting: i - 1 })));
-      tag.classList.add("band-radio-select");
-    } else {
-      tag = el("span", "im-text band-radio", radioName);
-    }
-    tag.title = "Radio this band is received with";
-    const remove = button("X", () => run(() => api.removeBand(band.id)));
-    remove.title = "Remove this band";
-    body.append(row(select, name, tag, remove));
-  }
-  const add = button("Add Band", () => {
-    const base = state.bands.find((b) => b.id === selected) ?? state.bands[state.bands.length - 1];
-    run(() => api.addBand({ frequency: base ? base.frequency : 100e6 }));
-  });
-  add.classList.add("im-fill");
-  body.append(row(add));
-}
-
-function renderDisplay() {
-  const d = state.display;
-  const body = displaySection.body;
-  const set = (display: Partial<api.Display>) => run(() => api.setDisplay(display));
-  const windows = ["Rectangular", "Blackman", "Nuttall"];
-  body.replaceChildren(
-    row(checkbox("Show Waterfall", d.showWaterfall, (v) => set({ showWaterfall: v }))),
-    row(checkbox("FFT Hold", d.fftHold, (v) => set({ fftHold: v }))),
-    leftLabel("FFT Hold Speed", inputInt(d.fftHoldSpeed, 1, (v) => set({ fftHoldSpeed: v }))),
-    leftLabel("FFT Mode", combo(["Line", "Persistence"], d.fftMode === "persistence" ? 1 : 0, (i) => set({ fftMode: i === 1 ? "persistence" : "line" }))),
-    leftLabel("Persistence Speed", inputInt(d.persistenceSpeed, 5, (v) => set({ persistenceSpeed: v }))),
-    row(checkbox("FFT Smoothing", d.fftSmoothing, (v) => set({ fftSmoothing: v }))),
-    leftLabel("FFT Smoothing Speed", inputInt(d.fftSmoothingSpeed, 1, (v) => set({ fftSmoothingSpeed: v }))),
-    leftLabel("FFT Framerate", inputInt(d.fftRate, 1, (v) => set({ fftRate: v }))),
-    leftLabel("FFT Size", combo(state.fftSizes.map(String), state.fftSizes.indexOf(d.fftSize), (i) => set({ fftSize: state.fftSizes[i] }))),
-    leftLabel("FFT Window", combo(windows, d.fftWindow, (i) => set({ fftWindow: i }))),
-    leftLabel("Color Map", combo(state.colorMaps.map((c) => c.name), state.colorMaps.findIndex((c) => c.name === d.colorMap), (i) => set({ colorMap: state.colorMaps[i].name }))),
-    row(el("span", "im-text", `Color map Author: ${colorMapAuthor}`)),
-  );
-}
-
-function renderTheme() {
-  const index = state.themes.findIndex((t) => t.name === state.display.theme);
-  const select = combo(state.themes.map((t) => t.name), index, (i) => run(() => api.setDisplay({ theme: state.themes[i].name })));
-  themeSection.body.replaceChildren(leftLabel("Theme", select));
-}
-
-// --- interference ---------------------------------------------------------------------------
-
-function applyInterference(next: Interference) {
-  interference = next;
-  renderInterference();
-  panes.forEach((p, id) => p.setEvents(next.active.filter((e) => e.band === id)));
-
-  // Count in the top bar, so it is seen with the menu closed too
-  const alerts = $("alerts");
-  const n = next.active.length;
-  alerts.hidden = n === 0;
-  if (n > 0) {
-    const first = next.active[0];
-    alerts.textContent = `${n} interference${n > 1 ? "s" : ""}: ${typeInfo(first.type).label} ${first.type === "noise" ? "" : hz(first.center)}`;
-  }
-}
-
-function renderInterference() {
-  if (interference && state) interferenceMenu.render(interference, state.bands, selected, state.running);
+function showWorstAlert() {
+  if (!interference || interference.active.length === 0) return;
+  if (feed.collapsed) feed.setCollapsed(false);
+  focusEvent(sortEvents(interference.active, interference.settings)[0]);
 }
 
 async function runInterference(action: () => Promise<Interference>) {
@@ -334,107 +282,106 @@ async function runInterference(action: () => Promise<Interference>) {
     actionError = "";
   } catch (e) {
     actionError = e instanceof Error ? e.message : String(e);
-    // Show the stored values again instead of the refused ones
-    interferenceMenu.invalidate();
-    renderInterference();
+    drawer.refresh();
   }
   showError();
 }
 
-function focusEvent(e: api.InterferenceEvent) {
-  if (!panes.has(e.band)) return;
-  selectBand(e.band);
-  panes.get(e.band)!.focusRange(e.low, e.high, e.type === "noise");
-}
-
-const interferenceMenu = new InterferenceMenu(interferenceSection.body, {
-  set: (settings) => runInterference(() => api.setInterference(settings)),
-  relearn: (band) => runInterference(() => api.relearn(band)),
-  clear: () => runInterference(() => api.clearHistory()),
+const feed = new AlertFeed($("alerts"), {
   focus: focusEvent,
+  clear: () => runInterference(() => api.clearHistory()),
 });
 
-$("alerts").addEventListener("click", () => {
-  const first = interference?.active[0];
-  if (first) focusEvent(first);
-});
+const timeline = new Timeline($("timelineBox"), $<HTMLCanvasElement>("timeline"), $("timelineChevron"), $("timelineSummary"), $("timelineToggle"), focusEvent);
 
-// Menu width, dragged like the column border in SDR++
-(() => {
-  const handle = $("menuResize");
-  const apply = (w: number) => document.documentElement.style.setProperty("--menu-width", `${Math.min(Math.max(w, 200), 700)}px`);
-  apply(stored("sdrpp.menuWidth", 300));
-  handle.addEventListener("pointerdown", (ev) => handle.setPointerCapture(ev.pointerId));
-  handle.addEventListener("pointermove", (ev) => {
-    if (!handle.hasPointerCapture(ev.pointerId)) return;
-    apply(ev.clientX);
-    store("sdrpp.menuWidth", Math.min(Math.max(ev.clientX, 200), 700));
-  });
-})();
-
-// --- bands and panes -----------------------------------------------------------------------
-
-function selectBand(id: number) {
-  selected = id;
-  store("sdrpp.selectedBand", id);
-  panes.forEach((p, bandId) => p.setSelected(bandId === id && panes.size > 1));
-  const band = state.bands.find((b) => b.id === id);
-  if (band) {
-    freqSelect.set(band.frequency);
-    $("bandLabel").textContent = state.bands.length > 1 ? band.name : "";
+function applyInterference(next: Interference) {
+  interference = next;
+  wall.panes.forEach((p, id) => p.setEvents(next.active.filter((e) => e.band === id)));
+  updateHealth();
+  if (state) {
+    feed.render(next, state.bands, state.running);
+    timeline.update(next, state.bands);
+    drawer.update(state, menus, next);
   }
-  syncZoomSlider();
-  renderBands();
-  renderInterference();
+  renderTopBar();
 }
 
-function syncPanes() {
-  const host = $("panes");
-  const ids = new Set(state.bands.map((b) => b.id));
-  for (const [id, pane] of panes) {
-    if (!ids.has(id)) {
-      pane.root.remove();
-      panes.delete(id);
-    }
-  }
+function updateHealth() {
+  if (!state) return;
+  const now = Date.now();
   for (const band of state.bands) {
-    let pane = panes.get(band.id);
-    if (!pane) {
-      pane = new Pane(band, settings, {
-        onSelect: selectBand,
-        onView: (id, offset, bandwidth, points) => {
-          stream.setView(id, offset, bandwidth, points);
-          if (id === selected) syncZoomSlider();
-        },
-        onTune: (id, frequency) => {
-          if (id === selected) freqSelect.set(frequency);
-          sendFrequency({ id, frequency });
-        },
-        onFftHeight: (height) => {
-          settings.fftHeight = height;
-          store("sdrpp.fftHeight", height);
-          panes.forEach((p) => p.settingsChanged());
-        },
-      });
-      panes.set(band.id, pane);
-    } else {
-      pane.setBand(band);
-    }
-    // The radio of this band also visits other bands
-    pane.hopping = (state.radios.find((r) => r.id === band.radio)?.bands.length ?? 0) > 1;
-    host.append(pane.root); // Keeps the panes in band order
+    const pane = wall.panes.get(band.id);
+    if (!pane) continue;
+    const det = interference?.bands.find((b) => b.id === band.id);
+    pane.setHealth(
+      bandHealth(band, state.radios, state.running, det, interference?.active ?? [], interference?.history ?? [], interference?.settings, now),
+      interference?.settings,
+    );
   }
-  const n = state.bands.length;
-  const columns = n <= 2 ? 1 : n <= 6 ? 2 : 3;
-  host.style.gridTemplateColumns = `repeat(${columns}, minmax(0, 1fr))`;
-  host.style.gridTemplateRows = `repeat(${Math.max(Math.ceil(n / columns), 1)}, minmax(0, 1fr))`;
-  host.classList.toggle("empty", n === 0);
-
-  if (!ids.has(selected) && state.bands.length > 0) selected = state.bands[0].id;
-  selectBand(selected);
 }
 
-// --- state ---------------------------------------------------------------------------------
+// --- settings drawer --------------------------------------------------------------------------
+
+const sendMenuAction = latest(async (v: { radio: number; action: api.MenuAction }) => {
+  await run(async () => {
+    menus[v.radio] = await api.menuAction(v.radio, v.action);
+    // A device or sample rate change shows up in the state
+    return api.getState();
+  });
+});
+
+const drawer = new SettingsDrawer($("drawer"), $("drawerScrim"), {
+  run,
+  runInterference,
+  menuAction: (radio, action) => sendMenuAction({ radio, action }),
+  appearance: getAppearance,
+  setAppearance: applyAppearance,
+  colorMapAuthor: () => colorMapAuthor,
+  selectedBand: () => selected,
+});
+
+async function refreshMenus() {
+  try {
+    menus = await Promise.all(state.radios.map((r) => api.getMenu(r.id)));
+  } catch {
+    menus = [];
+  }
+}
+
+// --- keyboard ---------------------------------------------------------------------------------
+
+window.addEventListener("keydown", (ev) => {
+  const target = ev.target instanceof Element ? ev.target : null;
+  if (ev.ctrlKey || ev.metaKey || ev.altKey || target?.closest("input, select, textarea")) return;
+  // Space on a focused button presses that button, not Start/Stop
+  if (ev.key === " " && target?.closest("button")) return;
+  if (ev.key === "Escape") {
+    if (drawer.isOpen) drawer.close();
+    else if (!$("levelsPop").hidden) $("levelsPop").hidden = true;
+    return;
+  }
+  if (drawer.isOpen) return;
+  if (ev.key === " ") {
+    ev.preventDefault();
+    toggleRunning();
+  } else if (/^[1-9]$/.test(ev.key)) {
+    const band = state?.bands[Number(ev.key) - 1];
+    if (band) {
+      selectBand(band.id);
+      wall.setMain(band.id);
+    }
+  } else if (ev.key === "g" || ev.key === "s") {
+    wall.setLayout(ev.key === "g" ? "grid" : "stack");
+  } else if (ev.key === "a") {
+    showWorstAlert();
+  } else if (ev.key === "l") {
+    feed.toggle();
+  } else if (ev.key === "t") {
+    timeline.toggle();
+  }
+});
+
+// --- state ------------------------------------------------------------------------------------
 
 // Messages of the monitor, such as a newly plugged device. Those from before the page was opened are not shown.
 let lastNotice = 0;
@@ -460,7 +407,7 @@ function showNotices(s: State, first: boolean) {
 
 function showError() {
   const banner = $("error");
-  const message = !connected ? "Lost connection to the monitor. Retrying..." : actionError || state?.error || "";
+  const message = !connected ? "Lost connection to the monitor. Retrying…" : actionError || state?.error || "";
   banner.hidden = message === "";
   banner.textContent = message;
 }
@@ -475,16 +422,19 @@ async function run(action: () => Promise<State>, clearError = true) {
     actionError = e instanceof Error ? e.message : String(e);
     showError();
     // Controls may show a value the server refused
-    renderSourceType();
-    renderRadioButtons();
-    renderBands();
-    renderDisplay();
+    drawer.refresh();
+    if (state) syncToolbar(state);
   }
+}
+
+function syncToolbar(s: State) {
+  modeSeg.set(s.display.fftMode === "persistence" ? 1 : 0);
+  waterfallToggle.set(s.display.showWaterfall);
 }
 
 const part = {
   source: (s: State) => JSON.stringify([s.running, s.sourceType, s.radioCount, s.radios.map((r) => [r.id, r.name, r.sampleRate, r.bands, r.device, r.online])]),
-  bands: (s: State) => JSON.stringify([s.bands, s.radios.map((r) => r.online), s.dwellMs, s.settleMs]),
+  bands: (s: State) => JSON.stringify([s.bands, s.radios.map((r) => [r.online, r.bands])]),
   display: (s: State) => JSON.stringify([s.display, s.fftSizes, s.colorMaps]),
 };
 
@@ -494,12 +444,9 @@ async function applyState(next: State) {
   settings.dwellMs = next.dwellMs;
   settings.fftRate = next.display.fftRate;
 
-  if (!prev || prev.display.theme !== next.display.theme) {
-    const theme = next.themes.find((t) => t.name === next.display.theme) ?? next.themes[0];
-    if (theme) await loadTheme(theme.file).catch(() => {});
-    panes.forEach((p) => p.queueDraw());
-    renderTheme();
-  }
+  if (next.running && (!prev || !prev.running)) runningSince = Date.now();
+  if (!next.running) runningSince = 0;
+
   if (!prev || prev.display.colorMap !== next.display.colorMap) {
     const map = next.colorMaps.find((c) => c.name === next.display.colorMap) ?? next.colorMaps[0];
     if (map) {
@@ -513,37 +460,39 @@ async function applyState(next: State) {
     }
   }
 
-  const displayChanged = !prev || part.display(prev) !== part.display(next);
-  if (displayChanged) {
+  if (!prev || part.display(prev) !== part.display(next)) {
     settings.min = next.display.min;
     settings.max = next.display.max;
     settings.showWaterfall = next.display.showWaterfall;
     settings.fftMode = next.display.fftMode ?? "line";
     settings.persistenceSpeed = next.display.persistenceSpeed ?? 20;
-    minSlider.set(settings.min);
-    maxSlider.set(settings.max);
-    panes.forEach((p) => p.settingsChanged());
-    renderDisplay();
+    wall.panes.forEach((p) => p.settingsChanged());
+    syncToolbar(next);
+    renderLevels();
   }
 
-  if (!prev || part.bands(prev) !== part.bands(next)) syncPanes();
-
-  if (!prev || part.source(prev) !== part.source(next)) {
-    renderSourceType();
-    renderRadioButtons();
-    await refreshMenus();
+  if (!prev || part.bands(prev) !== part.bands(next) || prev.running !== next.running) {
+    wall.sync(next.bands, next.radios.some((r) => r.online), next.running);
+    // The radio of a band also visits other bands
+    for (const band of next.bands) {
+      const pane = wall.panes.get(band.id);
+      if (pane) pane.hopping = (next.radios.find((r) => r.id === band.radio)?.bands.length ?? 0) > 1;
+    }
+    if (!next.bands.some((b) => b.id === selected) && next.bands.length > 0) selected = next.bands[0].id;
+    selectBand(selected);
   }
+
+  if (!prev || part.source(prev) !== part.source(next)) await refreshMenus();
 
   if (settings.running !== next.running) {
     settings.running = next.running;
-    panes.forEach((p) => p.queueDraw());
+    wall.panes.forEach((p) => p.queueDraw());
   }
 
   showNotices(next, !prev);
-
-  const icon = $<HTMLImageElement>("playIcon");
-  icon.src = next.running ? "res/icons/stop.png" : "res/icons/play.png";
-  icon.alt = next.running ? "Stop" : "Start";
+  updateHealth();
+  drawer.update(next, menus, interference);
+  renderTopBar();
   showError();
 }
 
@@ -555,6 +504,7 @@ async function poll() {
   } catch {
     connected = false;
     showError();
+    renderTopBar();
   }
   if (connected) {
     try {
@@ -563,40 +513,27 @@ async function poll() {
       // Shown again with the next poll
     }
   }
-  drawSnr();
   setTimeout(poll, 1000);
 }
 
 stream.onFrame = (frame) => {
-  const pane = panes.get(frame.bandId);
+  const pane = wall.panes.get(frame.bandId);
   if (pane?.hopping && !pane.live) {
     // The radio arrived on this band, so it left the others it shares time with
     const radio = state?.radios.find((r) => r.id === pane.band.radio);
-    radio?.bands.forEach((id) => id !== frame.bandId && panes.get(id)?.markAway());
+    radio?.bands.forEach((id) => id !== frame.bandId && wall.panes.get(id)?.markAway());
   }
   pane?.pushFrame(frame);
-  if (frame.bandId === selected) drawSnr();
 };
 stream.onStatus = (up) => {
-  if (up) panes.forEach((p) => p.resendView());
+  if (up) wall.panes.forEach((p) => p.resendView());
 };
 
-window.addEventListener("resize", drawSnr);
-
-// Keeps the dwell line moving between frames and shows HOLD as soon as frames stop
-(function tickHop() {
-  if (settings.running) panes.forEach((p) => p.hopping && p.queueDraw());
-  requestAnimationFrame(tickHop);
-})();
+// Title dots: green while a band is received, grey as soon as its frames stop
+setInterval(() => wall.panes.forEach((p) => p.updateLive()), 100);
 
 (async () => {
-  // Font used by SDR++
-  const font = new FontFace("Roboto", "url(res/fonts/Roboto-Medium.ttf)");
-  font.load().then((f) => {
-    document.fonts.add(f);
-    panes.forEach((p) => p.queueDraw());
-  }).catch(() => {});
-
+  renderTopBar();
   await poll();
   stream.connect();
 })();

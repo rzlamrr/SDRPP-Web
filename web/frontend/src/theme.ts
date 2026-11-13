@@ -1,10 +1,7 @@
-// SDR++ themes (root/res/themes/*.json) and color maps (root/res/colormaps/*.json), used unchanged.
+// Appearance of RF Sentinel (dark or light, from the CSS tokens in style.css) and the waterfall color maps
+// (root/res/colormaps/*.json).
 
 import { getJson } from "./api";
-
-export interface Theme {
-  [key: string]: string;
-}
 
 export interface ColorMap {
   name: string;
@@ -12,26 +9,51 @@ export interface ColorMap {
   map: string[];
 }
 
-// ImGui colors the interface uses, exposed as CSS variables of the same name
-const THEME_KEYS = [
-  "Text", "TextDisabled", "WindowBg", "ChildBg", "PopupBg", "Border", "FrameBg", "FrameBgHovered", "FrameBgActive",
-  "Button", "ButtonHovered", "ButtonActive", "Header", "HeaderHovered", "HeaderActive", "CheckMark", "SliderGrab",
-  "SliderGrabActive", "Separator", "PlotLines", "PlotHistogram", "ScrollbarBg", "ScrollbarGrab", "MenuBarBg",
-  "FFTHoldColor", "ClearColor", "WaterfallBackground", "TextSelectedBg",
-];
+export type Appearance = "dark" | "light";
 
-export let currentTheme: Theme = {};
+const APPEARANCE_KEY = "sentinel.appearance";
 
-export async function loadTheme(file: string): Promise<Theme> {
-  const theme = await getJson<Theme>(`res/themes/${encodeURIComponent(file)}`);
-  const root = document.documentElement;
-  for (const key of THEME_KEYS) {
-    if (typeof theme[key] === "string") root.style.setProperty(`--${key}`, theme[key]);
+// Colors the canvases need, read from the CSS tokens whenever the appearance changes
+export const chart = {
+  bg: "#0a0e14",
+  grid: "#1c2430",
+  axis: "#5b6b80",
+  text: "#c9d4e3",
+  trace: "#4da3ff",
+  hold: "#f5d142",
+  threshold: "#3ccf91",
+  muted: "#6b778a",
+};
+
+function readChartColors() {
+  const css = getComputedStyle(document.documentElement);
+  const get = (name: string, fallback: string) => css.getPropertyValue(name).trim() || fallback;
+  chart.bg = get("--chart-bg", chart.bg);
+  chart.grid = get("--chart-grid", chart.grid);
+  chart.axis = get("--chart-axis", chart.axis);
+  chart.text = get("--chart-text", chart.text);
+  chart.trace = get("--chart-trace", chart.trace);
+  chart.hold = get("--chart-hold", chart.hold);
+  chart.threshold = get("--chart-threshold", chart.threshold);
+  chart.muted = get("--chart-muted", chart.muted);
+}
+
+export function getAppearance(): Appearance {
+  try {
+    return localStorage.getItem(APPEARANCE_KEY) === "light" ? "light" : "dark";
+  } catch {
+    return "dark";
   }
-  // The SDR++ icons are white, which disappears on light themes
-  root.classList.toggle("light-icons", luminance(theme.Text ?? "#FFFFFFFF") < 0.5);
-  currentTheme = theme;
-  return theme;
+}
+
+export function setAppearance(appearance: Appearance) {
+  document.documentElement.dataset.theme = appearance;
+  try {
+    localStorage.setItem(APPEARANCE_KEY, appearance);
+  } catch {
+    // Not remembered, the page still switches
+  }
+  readChartColors();
 }
 
 export function loadColorMap(file: string): Promise<ColorMap> {
@@ -43,14 +65,9 @@ function parseHex(color: string): [number, number, number] {
   return [parseInt(hex.slice(0, 2), 16), parseInt(hex.slice(2, 4), 16), parseInt(hex.slice(4, 6), 16)];
 }
 
-function luminance(color: string): number {
-  const [r, g, b] = parseHex(color);
-  return (0.2126 * r + 0.7152 * g + 0.0722 * b) / 255;
-}
-
 export const PALETTE_SIZE = 1024;
 
-// Interpolated palette as RGBA words ready for ImageData (same resolution as WaterFall::updatePallette)
+// Interpolated palette as RGBA words ready for ImageData
 export function buildPalette(map: string[]): Uint32Array {
   const colors = map.map(parseHex);
   const palette = new Uint32Array(PALETTE_SIZE);

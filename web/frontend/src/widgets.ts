@@ -1,4 +1,6 @@
-// Small set of controls that look and behave like the Dear ImGui widgets SDR++ uses.
+// Form controls of the interface. The im-* ones are also used for the radio menus the source modules describe.
+
+import { ICONS, type IconName } from "./icons";
 
 export function el<K extends keyof HTMLElementTagNameMap>(tag: K, cls?: string, text?: string): HTMLElementTagNameMap[K] {
   const e = document.createElement(tag);
@@ -152,45 +154,7 @@ export function slider(opts: SliderOptions): HTMLDivElement {
   return root;
 }
 
-export interface VSlider {
-  set(value: number): void;
-}
-
-// Vertical slider of the waterfall controls. `bottom` and `top` are the values at each end.
-export function vslider(host: HTMLElement, bottom: number, top: number, value: number, onChange: (value: number) => void): VSlider {
-  host.classList.add("im-vslider");
-  const grab = el("div", "im-vgrab");
-  host.append(grab);
-  const GRAB = 14;
-
-  const place = () => {
-    const t = (value - bottom) / (top - bottom);
-    grab.style.bottom = `calc(${Math.min(Math.max(t, 0), 1)} * (100% - ${GRAB + 4}px) + 2px)`;
-  };
-  const fromPointer = (ev: PointerEvent) => {
-    const rect = host.getBoundingClientRect();
-    const t = Math.min(Math.max((rect.bottom - ev.clientY - GRAB / 2) / Math.max(rect.height - GRAB, 1), 0), 1);
-    value = bottom + t * (top - bottom);
-    place();
-    onChange(value);
-  };
-  host.addEventListener("pointerdown", (ev) => {
-    host.setPointerCapture(ev.pointerId);
-    fromPointer(ev);
-  });
-  host.addEventListener("pointermove", (ev) => {
-    if (host.hasPointerCapture(ev.pointerId)) fromPointer(ev);
-  });
-  place();
-  return {
-    set(v: number) {
-      value = v;
-      place();
-    },
-  };
-}
-
-// ImGui::LeftLabel: text on the left, the control fills the rest of the line
+// Text on the left, the control fills the rest of the line
 export function leftLabel(text: string, control: HTMLElement): HTMLDivElement {
   const row = el("div", "im-row");
   row.append(el("span", "im-left-label", text), control);
@@ -204,40 +168,69 @@ export function row(...children: HTMLElement[]): HTMLDivElement {
   return r;
 }
 
-export interface Section {
-  root: HTMLDivElement;
-  body: HTMLDivElement;
+// Puts an icon, and optionally text after it, into a button or span
+export function setIcon(target: HTMLElement, icon: IconName, text?: string) {
+  target.innerHTML = ICONS[icon];
+  if (text !== undefined) target.append(el("span", undefined, text));
 }
 
-// ImGui::CollapsingHeader. The open state is remembered per browser.
-export function collapsingHeader(title: string, defaultOpen = true): Section {
-  const key = `sdrpp.menu.${title}`;
-  let open = defaultOpen;
-  try {
-    const saved = localStorage.getItem(key);
-    if (saved !== null) open = saved === "1";
-  } catch {
-    // Storage can be unavailable, the default is fine
-  }
-  const root = el("div", "im-section");
-  const header = el("div", "im-header");
-  const arrow = el("span", "im-arrow");
-  header.append(arrow, el("span", undefined, title));
-  const body = el("div", "im-section-body");
-  const apply = () => {
-    arrow.textContent = open ? "▼" : "▶";
-    body.hidden = !open;
-  };
-  header.addEventListener("click", () => {
-    open = !open;
-    try {
-      localStorage.setItem(key, open ? "1" : "0");
-    } catch {
-      // Not remembered, nothing else to do
-    }
-    apply();
+export interface Segmented {
+  root: HTMLDivElement;
+  set(index: number): void;
+}
+
+// Row of mutually exclusive buttons
+export function segmented(items: string[], index: number, onChange: (index: number) => void, titles: string[] = []): Segmented {
+  const root = el("div", "seg");
+  const buttons = items.map((text, i) => {
+    const b = el("button", undefined, text);
+    b.type = "button";
+    if (titles[i]) b.title = titles[i];
+    b.addEventListener("click", () => {
+      set(i);
+      onChange(i);
+    });
+    root.append(b);
+    return b;
   });
-  apply();
-  root.append(header, body);
-  return { root, body };
+  const set = (i: number) => buttons.forEach((b, j) => b.classList.toggle("on", j === i));
+  set(index);
+  return { root, set };
+}
+
+// Plain checkbox with a label, for the toolbar
+export function toggle(text: string, value: boolean, onChange: (value: boolean) => void): { root: HTMLLabelElement; set(v: boolean): void } {
+  const root = el("label", "toggle");
+  const input = el("input");
+  input.type = "checkbox";
+  input.checked = value;
+  input.addEventListener("change", () => onChange(input.checked));
+  root.append(input, el("span", undefined, text));
+  return { root, set: (v) => (input.checked = v) };
+}
+
+// A panel's open or collapsed state, remembered per browser
+export function storedFlag(key: string, fallback: boolean): boolean {
+  try {
+    const v = localStorage.getItem(key);
+    return v === null ? fallback : v === "1";
+  } catch {
+    return fallback;
+  }
+}
+
+export function storeFlag(key: string, value: boolean) {
+  try {
+    localStorage.setItem(key, value ? "1" : "0");
+  } catch {
+    // Not remembered, the panel still toggles
+  }
+}
+
+export function section(title: string): HTMLHeadingElement {
+  return el("h3", undefined, title);
+}
+
+export function hint(text: string): HTMLParagraphElement {
+  return el("p", "hint", text);
 }

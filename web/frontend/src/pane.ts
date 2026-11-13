@@ -1,18 +1,21 @@
-// One band drawn like the SDR++ waterfall widget (gui/widgets/waterfall.cpp):
-// FFT on top with dB and frequency scales, waterfall underneath.
+// One band tile of the wall: a header with the band's health, the spectrum with its dB and frequency
+// scales and the waterfall underneath, and a footer with the noise floor figures.
 
-import type { BandState, InterferenceEvent } from "./api";
+import type { BandState, InterferenceEvent, InterferenceSettings } from "./api";
 import type { FftFrame } from "./stream";
-import { PALETTE_SIZE, currentTheme } from "./theme";
+import { PALETTE_SIZE, chart } from "./theme";
 import { typeInfo } from "./interference";
-import { el } from "./widgets";
+import { STATUS, type BandHealth } from "./status";
+import { el, setIcon } from "./widgets";
 
-// Settings shared by all panes, the equivalent of the single waterfall state in desktop SDR++
+const FONT = 'Inter, "Segoe UI", system-ui, sans-serif';
+
+// Settings shared by all panes
 export interface PaneSettings {
   min: number;
   max: number;
   showWaterfall: boolean;
-  fftHeight: number;
+  fftRatio: number; // Share of the plot height given to the spectrum when the waterfall is shown
   palette: Uint32Array;
   running: boolean;
   dwellMs: number; // Time a hopping radio stays on one band
@@ -25,7 +28,8 @@ export interface PaneCallbacks {
   onSelect(band: number): void;
   onView(band: number, offset: number, bandwidth: number, points: number): void;
   onTune(band: number, frequency: number): void;
-  onFftHeight(height: number): void;
+  onFftRatio(ratio: number): void;
+  onExpand(band: number): void;
 }
 
 interface Row {
@@ -35,15 +39,19 @@ interface Row {
   gap?: boolean; // First line after the radio came back from other bands
 }
 
-// Geometry of the widget in CSS pixels, taken from WaterFall::updateWaterfallFb / onPositionChange
-const LEFT = 50;
-const RIGHT = 10;
-const TOP = 9;
-const FREQ_AREA = 40;
-const MIN_FFT_HEIGHT = 50;
+// Geometry of the plot in CSS pixels. Small tiles drop the dB scale and shrink the frequency scale.
+interface Geometry {
+  left: number;
+  right: number;
+  top: number;
+  freqArea: number;
+  minFft: number;
+  small: boolean;
+}
+const NORMAL: Geometry = { left: 46, right: 10, top: 8, freqArea: 26, minFft: 50, small: false };
+const SMALL: Geometry = { left: 4, right: 4, top: 4, freqArea: 16, minFft: 24, small: true };
 const MIN_VIEW_BANDWIDTH = 1000;
 const MAX_ROWS = 2000;
-const GRID = "rgb(50, 50, 50)";
 
 // Level axis of the persistence histogram. Fixed in dB, so changing Min/Max only changes what is drawn.
 const P_DB_MIN = -170;
@@ -106,10 +114,10 @@ export class Pane {
   private wfDirty = true;
   private hover: { x: number; y: number } | null = null;
   private lastFrameAt = 0;
-  private dwellStart = 0;
   private away = false;
   // True when the band's radio shares its time with other bands
   hopping = false;
+  private dotLive: boolean | null = null;
   // Active interference on this band, marked on the spectrum
   private events: InterferenceEvent[] = [];
 
@@ -119,33 +127,143 @@ export class Pane {
   private persistCanvas = document.createElement("canvas");
   private persistCtx = this.persistCanvas.getContext("2d")!;
 
+  private g: Geometry = NORMAL;
+  private body: HTMLDivElement;
+  private head = {
+    dot: el("span", "tile-dot"),
+    name: el("span", "tile-name"),
+    range: el("span", "tile-range"),
+    radio: el("span", "tile-radio"),
+    status: el("span", "tile-status"),
+    count: el("span", "tile-count"),
+    expand: el("button", "btn ghost small icon tile-expand"),
+  };
+  private foot = el("div", "tile-foot");
+  private health: BandHealth | null = null;
+  // Level the detector reports a frequency as occupied at: baseline noise floor plus the threshold
+  private detectLevel: number | null = null;
+
   constructor(band: BandState, private settings: PaneSettings, private cb: PaneCallbacks) {
     this.band = band;
-    this.root = el("div", "pane");
+    this.root = el("div", "tile");
+    const head = el("div", "tile-head");
+    head.title = "Click to make this the main band";
+    const h = this.head;
+    h.radio.title = "Radio that receives this band";
+    h.expand.type = "button";
+    setIcon(h.expand, "expand");
+    h.expand.title = "Make this the main band";
+    h.count.hidden = true;
+    head.append(h.dot, h.name, h.range, el("span", "spacer"), h.radio, h.status, h.count, h.expand);
+    head.addEventListener("click", () => this.cb.onExpand(this.band.id));
+
+    this.body = el("div", "pane");
     this.canvas = el("canvas", "pane-canvas");
     this.wfCanvas = el("canvas", "pane-waterfall");
-    this.root.append(this.wfCanvas, this.canvas);
+    this.body.append(this.wfCanvas, this.canvas);
+    this.root.append(head, this.body, this.foot);
     this.ctx = this.canvas.getContext("2d")!;
     this.wfCtx = this.wfCanvas.getContext("2d", { willReadFrequently: false })!;
-    new ResizeObserver(() => this.layout()).observe(this.root);
+    new ResizeObserver(() => this.layout()).observe(this.body);
     this.bindPointer();
+    this.renderHead();
+    this.renderFoot();
+  }
+
+  // --- tile header and footer ------------------------------------------------------------
+
+  private renderHead() {
+    const h = this.head;
+    h.name.textContent = this.band.name;
+    const bw = this.band.sampleRate;
+    h.range.textContent = bw > 0 ? `${printAndScale(this.band.frequency - bw / 2)}–${printAndScale(this.band.frequency + bw / 2)}Hz` : printAndScale(this.band.frequency) + "Hz";
+    h.radio.textContent = this.band.radio >= 0 ? `R${this.band.radio + 1}` : "–";
+    h.radio.hidden = this.band.radio < 0;
+    const health = this.health;
+    const status = health?.status ?? "idle";
+    const info = STATUS[status];
+    const n = health?.active.length ?? 0;
+    h.count.hidden = n === 0;
+    h.count.textContent = String(n);
+    h.count.title = `${n} active interference${n > 1 ? "s" : ""}`;
+    h.status.hidden = n > 0;
+    h.status.style.color = info.color;
+    h.status.textContent = status === "learning" && health?.detector ? `Learning ${Math.round(health.detector.learnProgress * 100)}%` : info.label;
+    for (const s of Object.keys(STATUS)) this.root.classList.toggle(`st-${s}`, s === status);
+  }
+
+  private renderFoot() {
+    const parts: string[] = [];
+    const health = this.health;
+    const d = health?.detector;
+    if (d && health?.status === "learning") {
+      parts.push(`<span>Learning baseline</span><span class="learn-bar"><div style="width:${Math.round(d.learnProgress * 100)}%"></div></span>`);
+    } else if (d && health?.status !== "idle" && health?.status !== "offline") {
+      parts.push(`<span>Floor <b>${d.noiseFloor.toFixed(1)} dB</b></span>`);
+      if (health.delta !== null) {
+        const cls = health.delta > 3 ? "up" : health.delta > 1 ? "mid" : "flat";
+        parts.push(`<span class="${cls}">${health.delta >= 0 ? "+" : ""}${health.delta.toFixed(1)} dB vs baseline</span>`);
+      }
+    } else if (health?.status === "offline") {
+      parts.push("<span>No device connected for this band's radio</span>");
+    } else {
+      parts.push("<span>Stopped</span>");
+    }
+    if (this.latest && this.settings.running && !this.stale) {
+      parts.push(`<span class="extra">SNR <b>${this.latest.snr.toFixed(1)} dB</b></span>`);
+      const occ = this.occupancy();
+      if (occ !== null) parts.push(`<span class="extra">Occupied <b>${Math.round(occ * 100)}%</b></span>`);
+    }
+    if (this.hopping) parts.push(`<span class="extra">Radio shared with other bands</span>`);
+    this.foot.innerHTML = parts.join("");
+  }
+
+  // Health of the band and the detector settings, given once a second by the wall
+  setHealth(health: BandHealth, settings: InterferenceSettings | undefined) {
+    this.health = health;
+    const d = health.detector;
+    this.detectLevel = d && !d.learning && settings?.enabled ? d.baselineFloor + settings.thresholdDb : null;
+    this.renderHead();
+    this.renderFoot();
+    this.queueDraw();
+  }
+
+  // The main band of the grid: shown large at the top. It is already main, so it has no enlarge button.
+  setBig(big: boolean) {
+    this.root.classList.toggle("big", big);
+    this.head.expand.hidden = big;
+    this.root.querySelector(".tile-head")!.setAttribute("title", big ? "Main band" : "Click to make this the main band");
+  }
+
+  // Share of the latest spectrum above the detection level, null when there is no level yet
+  occupancy(): number | null {
+    const row = this.rows[0];
+    if (!row || this.detectLevel === null || row.gap) return null;
+    let n = 0;
+    for (let i = 0; i < row.data.length; i++) if (row.data[i] > this.detectLevel) n++;
+    return row.data.length ? n / row.data.length : null;
+  }
+
+  // Levels of the latest line, for Auto level
+  latestLevels(): Float32Array | null {
+    return this.rows[0] && !this.rows[0].gap ? this.rows[0].data : null;
   }
 
   // --- geometry -------------------------------------------------------------------------
 
   private get dataWidth() {
-    return Math.max(Math.floor(this.width - LEFT - RIGHT), 16);
+    return Math.max(Math.floor(this.width - this.g.left - this.g.right), 16);
   }
 
   private get fftHeight() {
-    const available = this.height - TOP - FREQ_AREA;
-    if (!this.settings.showWaterfall) return Math.max(available - 2, MIN_FFT_HEIGHT);
-    // With several panes on screen the waterfall always keeps at least 40% of the height
-    return Math.min(Math.max(this.settings.fftHeight, MIN_FFT_HEIGHT), Math.max(Math.floor(available * 0.6), MIN_FFT_HEIGHT));
+    const available = this.height - this.g.top - this.g.freqArea;
+    if (!this.settings.showWaterfall) return Math.max(available - 2, this.g.minFft);
+    const ratio = Math.min(Math.max(this.settings.fftRatio, 0.2), 0.8);
+    return Math.max(Math.floor(available * ratio), this.g.minFft);
   }
 
   private get wfTop() {
-    return TOP + this.fftHeight + FREQ_AREA + 1;
+    return this.g.top + this.fftHeight + this.g.freqArea + 1;
   }
 
   private get wfHeight() {
@@ -211,6 +329,7 @@ export class Pane {
     const changed = band.frequency !== this.band.frequency || band.sampleRate !== this.band.sampleRate;
     const rateChanged = band.sampleRate !== this.band.sampleRate;
     this.band = band;
+    this.renderHead();
     if (rateChanged) {
       this.viewOffset = 0;
       this.viewBandwidth = 0;
@@ -239,6 +358,7 @@ export class Pane {
   }
 
   setSelected(selected: boolean) {
+    // Shown with the accent border
     this.root.classList.toggle("selected", selected);
   }
 
@@ -253,10 +373,10 @@ export class Pane {
     const now = performance.now();
     // A frame after a pause starts a new visit of the radio
     const newVisit = !this.live;
-    if (newVisit) this.dwellStart = now;
     this.away = false;
     this.latest = frame;
     this.lastFrameAt = now;
+    this.updateLive();
     const row: Row = {
       data: frame.fft,
       lower: frame.centerFreq + frame.viewOffset - frame.viewBandwidth / 2,
@@ -469,13 +589,15 @@ export class Pane {
   // --- drawing ---------------------------------------------------------------------------
 
   private layout() {
-    const rect = this.root.getBoundingClientRect();
+    const rect = this.body.getBoundingClientRect();
     const width = Math.floor(rect.width);
     const height = Math.floor(rect.height);
     if (width <= 0 || height <= 0) return;
     const sizeChanged = width !== this.width || height !== this.height;
     this.width = width;
     this.height = height;
+    // Small tiles keep the plot and drop the dB scale
+    this.g = width < 380 || height < 170 ? SMALL : NORMAL;
 
     const dpr = window.devicePixelRatio || 1;
     this.canvas.width = Math.round(width * dpr);
@@ -487,7 +609,7 @@ export class Pane {
     const wfHeight = this.wfHeight;
     this.wfCanvas.width = this.dataWidth;
     this.wfCanvas.height = wfHeight;
-    this.wfCanvas.style.left = `${LEFT}px`;
+    this.wfCanvas.style.left = `${this.g.left}px`;
     this.wfCanvas.style.top = `${this.wfTop}px`;
     this.wfCanvas.style.width = `${this.dataWidth}px`;
     this.wfCanvas.style.height = `${wfHeight}px`;
@@ -517,35 +639,39 @@ export class Pane {
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     ctx.clearRect(0, 0, this.width, this.height);
 
-    const text = currentTheme.Text ?? "#FFFFFFFF";
-    const trace = currentTheme.PlotLines ?? "#66E5FFFF";
-    const holdColor = currentTheme.FFTHoldColor ?? "#FFFF00FF";
+    const text = chart.text;
+    const trace = chart.trace;
+    const holdColor = chart.hold;
+    const grid = chart.grid;
+    const small = this.g.small;
     const { min, max } = this.settings;
     const dataWidth = this.dataWidth;
     const fftHeight = this.fftHeight;
-    const fftBottom = TOP + fftHeight;
+    const fftBottom = this.g.top + fftHeight;
     const lower = this.lower;
     const viewWidth = this.viewWidth;
     const upper = lower + viewWidth;
 
-    ctx.font = "13px Roboto, sans-serif";
+    ctx.font = `11px ${FONT}`;
     ctx.textBaseline = "middle";
     ctx.lineWidth = 1;
 
-    // Vertical scale
-    const textHeight = 16;
+    // Vertical scale: grid lines always, labels only on tiles large enough for them
+    const textHeight = small ? 22 : 16;
     const vRange = findBestRange(max - min, Math.max(Math.floor(fftHeight / textHeight), 1));
     const vScale = fftHeight / Math.max(max - min, 1e-6);
     ctx.textAlign = "right";
     for (let line = Math.floor(max / vRange) * vRange; line > min; line -= vRange) {
       const y = Math.round(fftBottom - (line - min) * vScale) + 0.5;
-      ctx.strokeStyle = GRID;
+      ctx.strokeStyle = grid;
       ctx.beginPath();
-      ctx.moveTo(LEFT, y);
-      ctx.lineTo(LEFT + dataWidth, y);
+      ctx.moveTo(this.g.left, y);
+      ctx.lineTo(this.g.left + dataWidth, y);
       ctx.stroke();
-      ctx.fillStyle = text;
-      ctx.fillText(String(Math.round(line)), LEFT - 10, y);
+      if (!small) {
+        ctx.fillStyle = text;
+        ctx.fillText(String(Math.round(line)), this.g.left - 8, y);
+      }
     }
 
     // Horizontal scale
@@ -554,19 +680,19 @@ export class Pane {
     const hScale = dataWidth / viewWidth;
     ctx.textAlign = "center";
     for (let freq = Math.ceil(lower / hRange) * hRange; freq < upper; freq += hRange) {
-      const x = Math.round(LEFT + (freq - lower) * hScale) + 0.5;
-      ctx.strokeStyle = GRID;
+      const x = Math.round(this.g.left + (freq - lower) * hScale) + 0.5;
+      ctx.strokeStyle = grid;
       ctx.beginPath();
-      ctx.moveTo(x, TOP + 1);
+      ctx.moveTo(x, this.g.top + 1);
       ctx.lineTo(x, fftBottom);
       ctx.stroke();
-      ctx.strokeStyle = text;
+      ctx.strokeStyle = chart.axis;
       ctx.beginPath();
       ctx.moveTo(x, fftBottom);
-      ctx.lineTo(x, fftBottom + 7);
+      ctx.lineTo(x, fftBottom + (small ? 3 : 5));
       ctx.stroke();
       ctx.fillStyle = text;
-      ctx.fillText(printAndScale(freq), x, fftBottom + 22);
+      ctx.fillText(printAndScale(freq), x, fftBottom + (small ? 10 : 15));
     }
 
     // FFT trace with its shadow, then the hold trace
@@ -574,15 +700,15 @@ export class Pane {
     if (row && this.latest) {
       ctx.save();
       ctx.beginPath();
-      ctx.rect(LEFT, TOP, dataWidth, fftHeight + 1);
+      ctx.rect(this.g.left, this.g.top, dataWidth, fftHeight + 1);
       ctx.clip();
       const path = (data: Float32Array) => {
         const n = data.length;
         const xStep = (row.width / n) * hScale;
-        const x0 = LEFT + (row.lower - lower) * hScale + xStep / 2;
+        const x0 = this.g.left + (row.lower - lower) * hScale + xStep / 2;
         ctx.beginPath();
         for (let i = 0; i < n; i++) {
-          const y = Math.min(Math.max(fftBottom - (data[i] - min) * vScale, TOP + 1), fftBottom);
+          const y = Math.min(Math.max(fftBottom - (data[i] - min) * vScale, this.g.top + 1), fftBottom);
           if (i === 0) ctx.moveTo(x0, y);
           else ctx.lineTo(x0 + i * xStep, y);
         }
@@ -592,7 +718,7 @@ export class Pane {
         const stale = !this.persist || this.persistDirty || this.persist.cols !== dataWidth || this.persist.lower !== lower || this.persist.width !== viewWidth;
         if (stale) this.renderPersistence();
         ctx.imageSmoothingEnabled = false;
-        ctx.drawImage(this.persistCanvas, LEFT, TOP, this.persistCanvas.width, this.persistCanvas.height);
+        ctx.drawImage(this.persistCanvas, this.g.left, this.g.top, this.persistCanvas.width, this.persistCanvas.height);
         // The latest line, faint, so the current state is still readable
         path(row.data);
         ctx.globalAlpha = 0.35;
@@ -619,50 +745,71 @@ export class Pane {
       ctx.restore();
     }
 
+    // Detection level: what rises above this line is reported as interference
+    if (this.detectLevel !== null && this.detectLevel > min && this.detectLevel < max) {
+      const y = Math.round(fftBottom - (this.detectLevel - min) * vScale) + 0.5;
+      ctx.save();
+      ctx.setLineDash([6, 5]);
+      ctx.strokeStyle = chart.threshold;
+      ctx.globalAlpha = 0.85;
+      ctx.beginPath();
+      ctx.moveTo(this.g.left, y);
+      ctx.lineTo(this.g.left + dataWidth, y);
+      ctx.stroke();
+      if (!small) {
+        ctx.setLineDash([]);
+        ctx.fillStyle = chart.threshold;
+        ctx.textAlign = "right";
+        ctx.font = `11px ${FONT}`;
+        ctx.fillText("detection level", this.g.left + dataWidth - 6, y - 8);
+      }
+      ctx.restore();
+    }
+
     this.drawEvents(ctx, lower, hScale, fftBottom);
 
-    // Axes, separator under the frequency scale and the widget outline
-    ctx.strokeStyle = text;
+    // Axes and the separator under the frequency scale
+    ctx.strokeStyle = chart.axis;
     ctx.beginPath();
-    ctx.moveTo(LEFT, fftBottom + 0.5);
-    ctx.lineTo(LEFT + dataWidth, fftBottom + 0.5);
-    ctx.moveTo(LEFT + 0.5, TOP);
-    ctx.lineTo(LEFT + 0.5, fftBottom);
+    ctx.moveTo(this.g.left, fftBottom + 0.5);
+    ctx.lineTo(this.g.left + dataWidth, fftBottom + 0.5);
+    ctx.moveTo(this.g.left + 0.5, this.g.top);
+    ctx.lineTo(this.g.left + 0.5, fftBottom);
     ctx.stroke();
-    ctx.strokeStyle = GRID;
+    ctx.strokeStyle = grid;
     ctx.beginPath();
-    ctx.moveTo(0, fftBottom + FREQ_AREA + 0.5);
-    ctx.lineTo(this.width, fftBottom + FREQ_AREA + 0.5);
+    ctx.moveTo(0, fftBottom + this.g.freqArea + 0.5);
+    ctx.lineTo(this.width, fftBottom + this.g.freqArea + 0.5);
     ctx.stroke();
 
-    // Band name, and why there is no picture when there is none
-    ctx.textAlign = "left";
-    ctx.fillStyle = text;
-    ctx.font = "14px Roboto, sans-serif";
-    ctx.fillText(this.band.name, LEFT + 8, TOP + 12);
-    if (this.hopping && this.settings.running && this.latest) this.drawHop(ctx, ctx.measureText(this.band.name).width, trace);
+    // Why there is no picture when there is none
     if (!this.latest) {
-      ctx.fillStyle = currentTheme.TextDisabled ?? "#7F7F7FFF";
+      ctx.fillStyle = chart.muted;
       ctx.textAlign = "center";
-      const message = this.settings.running ? "Waiting for data from the radio..." : "No data. Press play to start the radios.";
-      ctx.fillText(message, LEFT + dataWidth / 2, TOP + fftHeight / 2);
+      ctx.font = `12px ${FONT}`;
+      const message = this.settings.running ? "Waiting for data from the radio…" : small ? "Stopped" : "No data. Press Start to run the radios.";
+      ctx.fillText(message, this.g.left + dataWidth / 2, this.g.top + fftHeight / 2);
     }
 
     // Frequency and level under the cursor
-    if (this.hover && this.hover.x >= LEFT && this.hover.x <= LEFT + dataWidth) {
-      const freq = lower + ((this.hover.x - LEFT) / dataWidth) * viewWidth;
+    if (this.hover && this.hover.x >= this.g.left && this.hover.x <= this.g.left + dataWidth) {
+      const freq = lower + ((this.hover.x - this.g.left) / dataWidth) * viewWidth;
       let label = `${printAndScale(Math.round(freq))}Hz`;
-      if (this.hover.y >= TOP && this.hover.y <= fftBottom) {
-        const db = max - ((this.hover.y - TOP) / fftHeight) * (max - min);
+      if (this.hover.y >= this.g.top && this.hover.y <= fftBottom) {
+        const db = max - ((this.hover.y - this.g.top) / fftHeight) * (max - min);
         label += `  ${db.toFixed(1)} dB`;
       }
-      ctx.font = "13px Roboto, sans-serif";
-      ctx.textAlign = "right";
-      ctx.fillStyle = text;
-      ctx.fillText(label, LEFT + dataWidth - 6, TOP + 12);
+      ctx.font = `12px ${FONT}`;
+      const w = ctx.measureText(label).width + 10;
+      const lx = Math.min(Math.max(this.hover.x + 8, this.g.left + 2), this.g.left + dataWidth - w - 2);
+      ctx.fillStyle = "rgba(8, 11, 16, 0.85)";
+      ctx.fillRect(lx, this.g.top + 4, w, 18);
+      ctx.textAlign = "left";
+      ctx.fillStyle = "#e3e9f2";
+      ctx.fillText(label, lx + 5, this.g.top + 13);
       ctx.strokeStyle = "rgba(255, 255, 255, 0.25)";
       ctx.beginPath();
-      ctx.moveTo(Math.round(this.hover.x) + 0.5, TOP);
+      ctx.moveTo(Math.round(this.hover.x) + 0.5, this.g.top);
       ctx.lineTo(Math.round(this.hover.x) + 0.5, this.height);
       ctx.stroke();
     }
@@ -673,7 +820,7 @@ export class Pane {
     if (this.events.length === 0) return;
     const dataWidth = this.dataWidth;
     ctx.save();
-    ctx.font = "bold 11px Roboto, sans-serif";
+    ctx.font = `bold 11px ${FONT}`;
     ctx.textBaseline = "middle";
     let noiseLine = 0;
     for (const e of this.events) {
@@ -682,96 +829,55 @@ export class Pane {
         // Covers the whole band: a frame around the spectrum and a label
         ctx.strokeStyle = info.color;
         ctx.lineWidth = 2;
-        ctx.strokeRect(LEFT + 1, TOP + 1, dataWidth - 2, fftBottom - TOP - 1);
+        ctx.strokeRect(this.g.left + 1, this.g.top + 1, dataWidth - 2, fftBottom - this.g.top - 1);
         ctx.fillStyle = info.color;
         ctx.textAlign = "left";
-        ctx.fillText(`NOISE FLOOR +${e.excess.toFixed(1)} dB`, LEFT + 8, TOP + 32 + noiseLine * 14);
+        ctx.fillText(`Noise floor +${e.excess.toFixed(1)} dB`, this.g.left + 8, this.g.top + (this.g.small ? 12 : 32) + noiseLine * 14);
         noiseLine++;
         continue;
       }
-      let x0 = LEFT + (e.low - lower) * hScale;
-      let x1 = LEFT + (e.high - lower) * hScale;
+      let x0 = this.g.left + (e.low - lower) * hScale;
+      let x1 = this.g.left + (e.high - lower) * hScale;
       if (x1 - x0 < 4) {
         const mid = (x0 + x1) / 2;
         x0 = mid - 2;
         x1 = mid + 2;
       }
-      if (x1 < LEFT || x0 > LEFT + dataWidth) continue;
-      x0 = Math.max(x0, LEFT + 1);
-      x1 = Math.min(x1, LEFT + dataWidth);
+      if (x1 < this.g.left || x0 > this.g.left + dataWidth) continue;
+      x0 = Math.max(x0, this.g.left + 1);
+      x1 = Math.min(x1, this.g.left + dataWidth);
       ctx.globalAlpha = 0.18;
       ctx.fillStyle = info.color;
-      ctx.fillRect(x0, TOP + 1, x1 - x0, fftBottom - TOP - 1);
+      ctx.fillRect(x0, this.g.top + 1, x1 - x0, fftBottom - this.g.top - 1);
       ctx.globalAlpha = 1;
       ctx.fillRect(x0, fftBottom + 1, x1 - x0, 4);
       ctx.strokeStyle = info.color;
       ctx.lineWidth = 1;
       ctx.beginPath();
-      ctx.moveTo(x0 + 0.5, TOP + 1);
+      ctx.moveTo(x0 + 0.5, this.g.top + 1);
       ctx.lineTo(x0 + 0.5, fftBottom);
-      ctx.moveTo(x1 - 0.5, TOP + 1);
+      ctx.moveTo(x1 - 0.5, this.g.top + 1);
       ctx.lineTo(x1 - 0.5, fftBottom);
       ctx.stroke();
       // Tag above the range
       const w = ctx.measureText(info.short).width + 8;
-      const tx = Math.min(Math.max((x0 + x1) / 2 - w / 2, LEFT + 1), LEFT + dataWidth - w);
-      ctx.fillRect(tx, TOP + 22, w, 15);
+      const tx = Math.min(Math.max((x0 + x1) / 2 - w / 2, this.g.left + 1), this.g.left + dataWidth - w);
+      const ty = this.g.small ? this.g.top + 2 : this.g.top + 26;
+      ctx.fillRect(tx, ty, w, 15);
       ctx.fillStyle = "#000";
       ctx.textAlign = "center";
-      ctx.fillText(info.short, tx + w / 2, TOP + 30);
+      ctx.fillText(info.short, tx + w / 2, ty + 8);
     }
     ctx.restore();
   }
 
-  // Time sharing of the radio: LIVE/HOLD badge, dwell progress and a line that crosses the pane
-  // from right to left during the dwell. The line shows time, the whole band is received at once.
-  private drawHop(ctx: CanvasRenderingContext2D, nameWidth: number, trace: string) {
-    const dataWidth = this.dataWidth;
-    const bottom = this.settings.showWaterfall ? this.wfTop + this.wfHeight : TOP + this.fftHeight;
-    const live = this.live;
-
-    if (!live) {
-      // Waiting for the radio: the last picture stays visible, dimmed
-      ctx.fillStyle = "rgba(0, 0, 0, 0.45)";
-      ctx.fillRect(LEFT + 1, TOP, dataWidth - 1, bottom - TOP);
-    }
-
-    // Badge to the right of the band name
-    ctx.font = "11px Roboto, sans-serif";
-    const label = live ? "LIVE" : "HOLD";
-    const bx = LEFT + 8 + nameWidth + 10;
-    const bw = ctx.measureText(label).width + 10;
-    ctx.fillStyle = live ? "rgb(40, 160, 60)" : "rgb(90, 90, 90)";
-    ctx.fillRect(bx, TOP + 4, bw, 16);
-    ctx.fillStyle = "#FFFFFF";
-    ctx.textAlign = "center";
-    ctx.fillText(label, bx + bw / 2, TOP + 12.5);
-    ctx.textAlign = "left";
-    ctx.font = "14px Roboto, sans-serif";
-
-    if (!live) return;
-    const t = Math.min((performance.now() - this.dwellStart) / Math.max(this.settings.dwellMs, 1), 1);
-
-    // Dwell progress along the top of the FFT
-    ctx.fillStyle = trace;
-    ctx.globalAlpha = 0.8;
-    ctx.fillRect(LEFT + 1, TOP + 1, (dataWidth - 1) * t, 3);
-
-    // Sweep line with a short trail behind it
-    const x = Math.round(LEFT + dataWidth * (1 - t)) + 0.5;
-    ctx.strokeStyle = trace;
-    for (let i = 4; i >= 0; i--) {
-      const xi = x + i * 3;
-      if (xi > LEFT + dataWidth) continue;
-      ctx.globalAlpha = i === 0 ? 0.85 : 0.25 - i * 0.05;
-      ctx.lineWidth = i === 0 ? 1.5 : 1;
-      ctx.beginPath();
-      ctx.moveTo(xi, TOP);
-      ctx.lineTo(xi, bottom);
-      ctx.stroke();
-    }
-    ctx.globalAlpha = 1;
-    ctx.lineWidth = 1;
+  // Title dot: green while this band is being received, grey while its radio is on another band or stopped
+  updateLive() {
+    const live = this.settings.running && this.live;
+    if (live === this.dotLive) return;
+    this.dotLive = live;
+    this.head.dot.classList.toggle("live", live);
+    this.head.dot.title = live ? "Receiving this band now" : this.settings.running ? (this.hopping ? "Radio is on another band, back shortly" : "No data from the radio") : "Stopped";
   }
 
   // --- interaction -----------------------------------------------------------------------
@@ -784,7 +890,7 @@ export class Pane {
       const rect = c.getBoundingClientRect();
       return { x: ev.clientX - rect.left, y: ev.clientY - rect.top };
     };
-    const onDivider = (y: number) => this.settings.showWaterfall && Math.abs(y - (TOP + this.fftHeight + FREQ_AREA)) <= 4;
+    const onDivider = (y: number) => this.settings.showWaterfall && Math.abs(y - (this.g.top + this.fftHeight + this.g.freqArea)) <= 4;
 
     c.addEventListener("pointerdown", (ev) => {
       if (ev.button !== 0) return;
@@ -801,7 +907,8 @@ export class Pane {
         const dx = p.x - drag.x;
         if (Math.abs(dx) > 2 || Math.abs(p.y - drag.y) > 2) drag.moved = true;
         if (drag.mode === "resize") {
-          this.cb.onFftHeight(Math.max(drag.startHeight + (p.y - drag.y), MIN_FFT_HEIGHT));
+          const available = Math.max(this.height - this.g.top - this.g.freqArea, 1);
+          this.cb.onFftRatio((drag.startHeight + (p.y - drag.y)) / available);
         } else if (drag.moved && dx !== 0) {
           // Dragging moves the view; past the edge of the band it moves the center frequency instead
           this.viewOffset -= (dx / this.dataWidth) * this.viewWidth;
@@ -833,7 +940,7 @@ export class Pane {
       (ev) => {
         ev.preventDefault();
         const p = local(ev);
-        const anchor = this.lower + (Math.min(Math.max(p.x - LEFT, 0), this.dataWidth) / this.dataWidth) * this.viewWidth;
+        const anchor = this.lower + (Math.min(Math.max(p.x - this.g.left, 0), this.dataWidth) / this.dataWidth) * this.viewWidth;
         this.setViewBandwidth(this.viewWidth * (ev.deltaY > 0 ? 1.25 : 0.8), anchor);
       },
       { passive: false },

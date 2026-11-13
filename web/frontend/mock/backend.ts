@@ -71,9 +71,14 @@ const INTERFERERS: Interferer[] = [
   { key: "sweep", type: "swept", active: (t) => t % 45 >= 20 && t % 45 < 26, on: (t) => t % 45 >= 20 && t % 45 < 26, center: (t) => 103e6 + ((t % 45) - 20) * 0.25e6, width: 20e3, level: -50 },
   { key: "block", type: "wideband", active: (t) => t % 75 >= 30 && t % 75 < 50, on: (t) => t % 75 >= 30 && t % 75 < 50, center: () => 92.5e6, width: 1.2e6, level: -78 },
   { key: "noise", type: "noise", active: (t) => t % 90 >= 60 && t % 90 < 72, on: (t) => t % 90 >= 60 && t % 90 < 72, center: () => 100e6, width: 0, level: 6 },
+  // Outside FM, so the other default bands get events too
+  { key: "gsm-cw", type: "narrowband", active: (t) => t % 50 < 30, on: (t) => t % 50 < 30, center: () => 947.3e6, width: 3e3, level: -50 },
+  { key: "wifi-burst", type: "pulsed", active: (t) => t % 70 >= 20 && t % 70 < 50, on: (t) => t % 70 >= 20 && t % 70 < 50 && t % 1.1 < 0.3, center: () => 2445e6, width: 2e6, level: -52 },
+  { key: "lte-block", type: "wideband", active: (t) => t % 80 >= 40 && t % 80 < 60, on: (t) => t % 80 >= 40 && t % 80 < 60, center: () => 1850e6, width: 4e6, level: -66 },
 ];
 
-const noiseRaised = (t: number) => INTERFERERS[4].on(t);
+// The noise rise is local to the band around 100 MHz
+const noiseRaised = (t: number, frequency = 100e6, bw = 20e6) => INTERFERERS[4].on(t) && Math.abs(frequency - 100e6) < bw / 2;
 
 // Power (linear, relative to full scale) of the pretend signals at a frequency
 function signalPower(freq: number, t: number): number {
@@ -209,7 +214,7 @@ export function mockBackend(): Plugin {
     radios = Array.from({ length: config.radioCount }, (_, i) => radios[i] ?? newRadio());
     assignDevices();
   }
-  bands = [newBand(1, "Band 1", 100e6)];
+  bands = [newBand(1, "FM Broadcast", 98e6), newBand(2, "GSM-900 DL", 947.5e6), newBand(3, "LTE-1800 DL", 1842.5e6), newBand(4, "ISM 2.4 GHz", 2441e6), newBand(5, "VHF Air", 127.5e6)];
   autoConfigure();
 
   function state() {
@@ -306,7 +311,7 @@ export function mockBackend(): Plugin {
     const hold = config.display.fftHold;
     const buf = Buffer.alloc(56 + n * 2 * (hold ? 2 : 1));
     const gain = radios[radio].gain;
-    const floor = 10 ** ((-112 + gain * 0.35 + (noiseRaised(t) ? 6 : 0)) / 10);
+    const floor = 10 ** ((-112 + gain * 0.35 + (noiseRaised(t, band.frequency, bw) ? 6 : 0)) / 10);
     const lower = band.frequency + voff - vbw / 2;
     if (hold && (!band.hold || band.hold.length !== n)) band.hold = new Float32Array(n).fill(-200);
     const holdSpeed = config.display.fftHoldSpeed / (config.display.fftRate * 10);
@@ -425,7 +430,7 @@ export function mockBackend(): Plugin {
         const started = learnStart.get(b.id);
         const progress = started === undefined ? 0 : Math.min((now - started) / (detection.learnSeconds * 1000), 1);
         const floor = floorOf(r);
-        return { id: b.id, enabled: detection.enabled, learning: progress < 1, learnProgress: progress, noiseFloor: floor + (noiseRaised(now / 1000) ? 6 : 0) + Math.random() * 0.3, baselineFloor: floor, active: [...activeEvents.values()].filter((e) => e.band === b.id).length };
+        return { id: b.id, enabled: detection.enabled, learning: progress < 1, learnProgress: progress, noiseFloor: floor + (noiseRaised(now / 1000, b.frequency, r >= 0 ? rate(r) : 0) ? 6 : 0) + Math.random() * 0.3, baselineFloor: floor, active: [...activeEvents.values()].filter((e) => e.band === b.id).length };
       }),
       active: [...activeEvents.values()],
       history,
