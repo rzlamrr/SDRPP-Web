@@ -14,6 +14,8 @@ export interface PaneSettings {
   fftHeight: number;
   palette: Uint32Array;
   running: boolean;
+  dwellMs: number; // Time a hopping radio stays on one band
+  fftRate: number; // FFT lines per second, used to tell a pause in the frames from the normal spacing
 }
 
 export interface PaneCallbacks {
@@ -27,6 +29,7 @@ interface Row {
   data: Float32Array;
   lower: number; // Absolute frequency of the first point
   width: number; // Frequency span of the row
+  gap?: boolean; // First line after the radio came back from other bands
 }
 
 // Geometry of the widget in CSS pixels, taken from WaterFall::updateWaterfallFb / onPositionChange
@@ -84,6 +87,10 @@ export class Pane {
   private wfDirty = true;
   private hover: { x: number; y: number } | null = null;
   private lastFrameAt = 0;
+  private dwellStart = 0;
+  private away = false;
+  // True when the band's radio shares its time with other bands
+  hopping = false;
 
   constructor(band: BandState, private settings: PaneSettings, private cb: PaneCallbacks) {
     this.band = band;
@@ -197,12 +204,18 @@ export class Pane {
   // --- data ------------------------------------------------------------------------------
 
   pushFrame(frame: FftFrame) {
+    const now = performance.now();
+    // A frame after a pause starts a new visit of the radio
+    const newVisit = !this.live;
+    if (newVisit) this.dwellStart = now;
+    this.away = false;
     this.latest = frame;
-    this.lastFrameAt = performance.now();
+    this.lastFrameAt = now;
     const row: Row = {
       data: frame.fft,
       lower: frame.centerFreq + frame.viewOffset - frame.viewBandwidth / 2,
       width: frame.viewBandwidth,
+      gap: newVisit && this.hopping && this.rows.length > 0,
     };
     this.rows.unshift(row);
     if (this.rows.length > MAX_ROWS) this.rows.length = MAX_ROWS;
@@ -223,7 +236,25 @@ export class Pane {
     return performance.now() - this.lastFrameAt > 1500;
   }
 
+  // True while frames arrive at the FFT rate, i.e. the radio is on this band now
+  get live() {
+    if (this.away) return false;
+    const limit = Math.max((3 * 1000) / Math.max(this.settings.fftRate, 1), 150);
+    return this.lastFrameAt > 0 && performance.now() - this.lastFrameAt < limit;
+  }
+
+  // The radio of this band moved on: another band of the same radio sent a frame.
+  // This catches short dwells, where the radio is back before frames look late.
+  markAway() {
+    this.away = true;
+  }
+
   private renderRow(row: Row, out: Uint32Array, start: number, width: number) {
+    if (row.gap) {
+      // Separator where time passed while the radio was on other bands (ABGR, little endian)
+      out.fill(0xff7f7f7f, start, start + width);
+      return;
+    }
     const { min, max, palette } = this.settings;
     const scale = (PALETTE_SIZE - 1) / Math.max(max - min, 1e-6);
     const lower = this.lower;
@@ -414,6 +445,7 @@ export class Pane {
     ctx.fillStyle = text;
     ctx.font = "14px Roboto, sans-serif";
     ctx.fillText(this.band.name, LEFT + 8, TOP + 12);
+    if (this.hopping && this.settings.running && this.latest) this.drawHop(ctx, ctx.measureText(this.band.name).width, trace);
     if (!this.latest) {
       ctx.fillStyle = currentTheme.TextDisabled ?? "#7F7F7FFF";
       ctx.textAlign = "center";
@@ -439,6 +471,57 @@ export class Pane {
       ctx.lineTo(Math.round(this.hover.x) + 0.5, this.height);
       ctx.stroke();
     }
+  }
+
+  // Time sharing of the radio: LIVE/HOLD badge, dwell progress and a line that crosses the pane
+  // from right to left during the dwell. The line shows time, the whole band is received at once.
+  private drawHop(ctx: CanvasRenderingContext2D, nameWidth: number, trace: string) {
+    const dataWidth = this.dataWidth;
+    const bottom = this.settings.showWaterfall ? this.wfTop + this.wfHeight : TOP + this.fftHeight;
+    const live = this.live;
+
+    if (!live) {
+      // Waiting for the radio: the last picture stays visible, dimmed
+      ctx.fillStyle = "rgba(0, 0, 0, 0.45)";
+      ctx.fillRect(LEFT + 1, TOP, dataWidth - 1, bottom - TOP);
+    }
+
+    // Badge to the right of the band name
+    ctx.font = "11px Roboto, sans-serif";
+    const label = live ? "LIVE" : "HOLD";
+    const bx = LEFT + 8 + nameWidth + 10;
+    const bw = ctx.measureText(label).width + 10;
+    ctx.fillStyle = live ? "rgb(40, 160, 60)" : "rgb(90, 90, 90)";
+    ctx.fillRect(bx, TOP + 4, bw, 16);
+    ctx.fillStyle = "#FFFFFF";
+    ctx.textAlign = "center";
+    ctx.fillText(label, bx + bw / 2, TOP + 12.5);
+    ctx.textAlign = "left";
+    ctx.font = "14px Roboto, sans-serif";
+
+    if (!live) return;
+    const t = Math.min((performance.now() - this.dwellStart) / Math.max(this.settings.dwellMs, 1), 1);
+
+    // Dwell progress along the top of the FFT
+    ctx.fillStyle = trace;
+    ctx.globalAlpha = 0.8;
+    ctx.fillRect(LEFT + 1, TOP + 1, (dataWidth - 1) * t, 3);
+
+    // Sweep line with a short trail behind it
+    const x = Math.round(LEFT + dataWidth * (1 - t)) + 0.5;
+    ctx.strokeStyle = trace;
+    for (let i = 4; i >= 0; i--) {
+      const xi = x + i * 3;
+      if (xi > LEFT + dataWidth) continue;
+      ctx.globalAlpha = i === 0 ? 0.85 : 0.25 - i * 0.05;
+      ctx.lineWidth = i === 0 ? 1.5 : 1;
+      ctx.beginPath();
+      ctx.moveTo(xi, TOP);
+      ctx.lineTo(xi, bottom);
+      ctx.stroke();
+    }
+    ctx.globalAlpha = 1;
+    ctx.lineWidth = 1;
   }
 
   // --- interaction -----------------------------------------------------------------------

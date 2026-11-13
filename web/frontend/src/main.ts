@@ -44,6 +44,8 @@ const settings: PaneSettings = {
   fftHeight: stored("sdrpp.fftHeight", 300),
   palette: buildPalette(["#000020", "#FFFFFF"]),
   running: false,
+  dwellMs: 100,
+  fftRate: 20,
 };
 
 // --- top bar -----------------------------------------------------------------------------
@@ -358,6 +360,8 @@ function syncPanes() {
     } else {
       pane.setBand(band);
     }
+    // The radio of this band also visits other bands
+    pane.hopping = (state.radios.find((r) => r.id === band.radio)?.bands.length ?? 0) > 1;
     host.append(pane.root); // Keeps the panes in band order
   }
   const n = state.bands.length;
@@ -427,6 +431,8 @@ const part = {
 async function applyState(next: State) {
   const prev = state;
   state = next;
+  settings.dwellMs = next.dwellMs;
+  settings.fftRate = next.display.fftRate;
 
   if (!prev || prev.display.theme !== next.display.theme) {
     const theme = next.themes.find((t) => t.name === next.display.theme) ?? next.themes[0];
@@ -493,7 +499,13 @@ async function poll() {
 }
 
 stream.onFrame = (frame) => {
-  panes.get(frame.bandId)?.pushFrame(frame);
+  const pane = panes.get(frame.bandId);
+  if (pane?.hopping && !pane.live) {
+    // The radio arrived on this band, so it left the others it shares time with
+    const radio = state?.radios.find((r) => r.id === pane.band.radio);
+    radio?.bands.forEach((id) => id !== frame.bandId && panes.get(id)?.markAway());
+  }
+  pane?.pushFrame(frame);
   if (frame.bandId === selected) drawSnr();
 };
 stream.onStatus = (up) => {
@@ -501,6 +513,12 @@ stream.onStatus = (up) => {
 };
 
 window.addEventListener("resize", drawSnr);
+
+// Keeps the dwell line moving between frames and shows HOLD as soon as frames stop
+(function tickHop() {
+  if (settings.running) panes.forEach((p) => p.hopping && p.queueDraw());
+  requestAnimationFrame(tickHop);
+})();
 
 (async () => {
   // Font used by SDR++
