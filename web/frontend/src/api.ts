@@ -4,7 +4,8 @@ export interface BandState {
   id: number;
   name: string;
   frequency: number;
-  radio: number;
+  radio: number; // Radio that receives the band
+  radioSetting: number; // Radio the band is tied to, -1 when the monitor picks
   sampleRate: number;
 }
 
@@ -14,6 +15,8 @@ export interface RadioState {
   sampleRate: number;
   bands: number[];
   receiving: boolean;
+  device: string; // Device the radio uses, empty when none is connected for it
+  online: boolean;
 }
 
 export interface Display {
@@ -46,6 +49,7 @@ export interface State {
   bands: BandState[];
   radios: RadioState[];
   error: string;
+  notices: { id: number; text: string }[]; // Latest messages for the operator, in order
   display: Display;
   fftSizes: number[];
   colorMaps: NamedFile[];
@@ -86,7 +90,7 @@ export const setSetup = (setup: Partial<Pick<State, "sourceType" | "radioCount" 
   request<State>("api/setup", "PUT", setup);
 export const setDisplay = (display: Partial<Display>) => request<State>("api/display", "PUT", display);
 export const addBand = (band: { name?: string; frequency: number }) => request<State>("api/bands", "POST", band);
-export const updateBand = (id: number, band: { name?: string; frequency?: number }) =>
+export const updateBand = (id: number, band: { name?: string; frequency?: number; radioSetting?: number }) =>
   request<State>(`api/bands/${id}`, "PUT", band);
 export const removeBand = (id: number) => request<State>(`api/bands/${id}`, "DELETE");
 export const getMenu = (radio: number) => request<Menu>(`api/radios/${radio}/menu`);

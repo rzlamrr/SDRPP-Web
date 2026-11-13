@@ -63,6 +63,9 @@ public:
         handler.startHandler = start;
         handler.stopHandler = stop;
         handler.tuneHandler = tune;
+        handler.listDevicesHandler = listDevices;
+        handler.selectDeviceHandler = selectDevice;
+        handler.selectedDeviceHandler = selectedDevice;
         handler.stream = &stream;
 
         refresh();
@@ -403,6 +406,42 @@ private:
             sprintf(buf, "%.1lfHz", bw);
         }
         return std::string(buf);
+    }
+
+    static std::vector<std::string> listDevices(void* ctx) {
+        std::vector<std::string> serials;
+        bladerf_devinfo* list = NULL;
+        int count = bladerf_get_device_list(&list);
+        for (int i = 0; i < count; i++) {
+            // A device that is open (here or elsewhere) cannot be asked for its serial, libbladeRF reports "ANY" instead
+            std::string serial = list[i].serial;
+            if (serial.empty() || serial == "ANY") { continue; }
+            serials.push_back(serial);
+        }
+        if (count > 0) { bladerf_free_device_list(list); }
+        return serials;
+    }
+
+    static bool selectDevice(std::string serial, void* ctx) {
+        BladeRFSourceModule* _this = (BladeRFSourceModule*)ctx;
+        if (_this->running) { return false; }
+        _this->refresh();
+        bool found = false;
+        for (int i = 0; i < _this->devCount; i++) {
+            if (serial == _this->devInfoList[i].serial) { found = true; }
+        }
+        // selectBySerial would fall back to the first device, which may be another radio's
+        if (!found) { return false; }
+        _this->selectBySerial(serial);
+        if (_this->selectedSerial != serial) { return false; }
+        core::setInputSampleRate(_this->sampleRate);
+        _this->saveDevice();
+        return true;
+    }
+
+    static std::string selectedDevice(void* ctx) {
+        BladeRFSourceModule* _this = (BladeRFSourceModule*)ctx;
+        return _this->selectedSerial;
     }
 
     static void menuSelected(void* ctx) {

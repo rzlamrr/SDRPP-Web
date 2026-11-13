@@ -33,6 +33,9 @@ namespace web {
         std::string name;
         double frequency;
 
+        // Index of the radio this band is tied to, -1 lets the engine pick one
+        int radioSetting = -1;
+
         // Receives every encoded frame
         std::function<void(const std::string&)> onFrame;
 

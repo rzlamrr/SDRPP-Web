@@ -7,6 +7,8 @@
 #include <config.h>
 #include <gui/smgui.h>
 #include <rtl-sdr.h>
+#include <algorithm>
+#include <vector>
 
 #ifdef __ANDROID__
 #include <android_backend.h>
@@ -75,6 +77,9 @@ public:
         handler.startHandler = start;
         handler.stopHandler = stop;
         handler.tuneHandler = tune;
+        handler.listDevicesHandler = listDevices;
+        handler.selectDeviceHandler = selectDevice;
+        handler.selectedDeviceHandler = selectedDevice;
         handler.stream = &stream;
 
         strcpy(dbTxt, "--");
@@ -310,6 +315,52 @@ private:
             sprintf(buf, "%.1lfHz", bw);
         }
         return std::string(buf);
+    }
+
+    // Same names as refresh(). A device that is open cannot be asked for its USB strings, it is left out.
+    static std::vector<std::string> listDevices(void* ctx) {
+        std::vector<std::string> names;
+#ifndef __ANDROID__
+        int count = rtlsdr_get_device_count();
+        char cbuf[512];
+        char venBuf[256];
+        char prodBuf[256];
+        char snBuf[256];
+        for (int i = 0; i < count; i++) {
+            venBuf[0] = prodBuf[0] = snBuf[0] = 0;
+            if (rtlsdr_get_device_usb_strings(i, venBuf, prodBuf, snBuf) != 0) { continue; }
+            if (venBuf[0] && prodBuf[0]) {
+                sprintf(cbuf, "%s %s [%s]", venBuf, prodBuf, snBuf[0] ? snBuf : "No Serial");
+            }
+            else {
+                sprintf(cbuf, "%s [%s]", rtlsdr_get_device_name(i), snBuf[0] ? snBuf : "No Serial");
+            }
+            names.push_back(cbuf);
+        }
+#else
+        RTLSDRSourceModule* _this = (RTLSDRSourceModule*)ctx;
+        _this->refresh();
+        names = _this->devNames;
+#endif
+        return names;
+    }
+
+    static bool selectDevice(std::string devName, void* ctx) {
+        RTLSDRSourceModule* _this = (RTLSDRSourceModule*)ctx;
+        if (_this->running) { return false; }
+        _this->refresh();
+        // selectByName would fall back to the first device, which may be another radio's
+        if (std::find(_this->devNames.begin(), _this->devNames.end(), devName) == _this->devNames.end()) { return false; }
+        _this->selectByName(devName);
+        if (_this->selectedDevName != devName) { return false; }
+        core::setInputSampleRate(_this->sampleRate);
+        _this->saveDevice();
+        return true;
+    }
+
+    static std::string selectedDevice(void* ctx) {
+        RTLSDRSourceModule* _this = (RTLSDRSourceModule*)ctx;
+        return _this->selectedDevName;
     }
 
     static void menuSelected(void* ctx) {

@@ -5,7 +5,11 @@
 #include <gui/smgui.h>
 #include <utils/flog.h>
 #include <algorithm>
+#include <condition_variable>
+#include <deque>
 #include <filesystem>
+#include <set>
+#include <thread>
 #include <fstream>
 #include <memory>
 #include <vector>
@@ -46,6 +50,22 @@ namespace web {
             Radio* activeRadio = NULL;
             bool running = false;
             std::string lastError;
+
+            // Device ids found by the last full scan, made while all radios were stopped
+            std::vector<std::string> devices;
+            // Devices seen by the last check of the watcher, to tell a newly plugged device apart
+            std::set<std::string> lastSeen;
+
+            // Messages for the operator, shown once by the browser
+            std::deque<json> notices;
+            int noticeId = 0;
+
+            // Looks for newly plugged devices while the monitor runs
+            std::thread watcher;
+            std::mutex watcherMtx;
+            std::condition_variable watcherCnd;
+            bool watching = false;
+            const auto WATCH_INTERVAL = std::chrono::seconds(3);
 
             const SourceType& sourceType() {
                 std::string id = config.conf["sourceType"].get<std::string>();
@@ -95,22 +115,117 @@ namespace web {
             void saveBands() {
                 json list = json::array();
                 for (auto& b : bands) {
-                    list.push_back({ { "id", b->id }, { "name", b->name }, { "frequency", b->frequency } });
+                    list.push_back({ { "id", b->id }, { "name", b->name }, { "frequency", b->frequency }, { "radioSetting", b->radioSetting } });
                 }
                 config.conf["bands"] = list;
                 saveConfig();
             }
 
-            // Spread the bands over the radios, in order
+            void notify(const std::string& text) {
+                flog::info("Web monitor: {0}", text);
+                notices.push_back({ { "id", ++noticeId }, { "text", text } });
+                while (notices.size() > 10) { notices.pop_front(); }
+            }
+
+            // A band tied to a radio without its device falls back to the automatic choice, and is tied again when the device returns
+            bool isTied(const Band& band) {
+                return band.radioSetting >= 0 && band.radioSetting < (int)radios.size() && radios[band.radioSetting]->online;
+            }
+
+            // Bands tied to a radio go there. The others are spread, in order, over the online radios with the fewest bands.
             void assignBands() {
-                std::vector<std::vector<std::shared_ptr<Band>>> groups(radios.size());
-                if (!radios.empty()) {
-                    for (size_t i = 0; i < bands.size(); i++) {
-                        groups[i % radios.size()].push_back(bands[i]);
+                typedef std::vector<std::shared_ptr<Band>> Group;
+                std::vector<Group> groups(radios.size());
+                std::vector<size_t> online;
+                for (size_t i = 0; i < radios.size(); i++) {
+                    if (radios[i]->online) { online.push_back(i); }
+                }
+                if (!online.empty()) {
+                    for (auto& b : bands) {
+                        if (isTied(*b)) { groups[b->radioSetting].push_back(b); }
+                    }
+                    for (auto& b : bands) {
+                        if (isTied(*b)) { continue; }
+                        size_t least = *std::min_element(online.begin(), online.end(), [&](size_t l, size_t r) { return groups[l].size() < groups[r].size(); });
+                        groups[least].push_back(b);
                     }
                 }
                 for (size_t i = 0; i < radios.size(); i++) {
                     radios[i]->setBands(groups[i]);
+                }
+            }
+
+            // --- devices ---
+
+            bool canManageDevices() {
+                if (radios.empty()) { return false; }
+                auto h = radios[0]->handler;
+                return h->listDevicesHandler && h->selectDeviceHandler && h->selectedDeviceHandler;
+            }
+
+            std::vector<std::string> listDevices() {
+                auto h = radios[0]->handler;
+                return h->listDevicesHandler(h->ctx);
+            }
+
+            // Only while stopped: an open device may be missing from the list
+            void scanDevices() {
+                if (!canManageDevices()) { return; }
+                devices = listDevices();
+                lastSeen = std::set<std::string>(devices.begin(), devices.end());
+            }
+
+            std::string shortId(const std::string& id) {
+                return id.size() > 16 ? id.substr(0, 16) : id;
+            }
+
+            // Gives every radio its own device from the last scan. A radio keeps its device if it is still there,
+            // the preferred radio (the one the operator just changed) first. Radios left without a device go offline.
+            // Only while stopped, selecting a device opens it.
+            void assignDevices(int preferred = -1) {
+                if (!canManageDevices()) {
+                    for (auto& r : radios) { r->online = true; }
+                    return;
+                }
+                std::set<std::string> available(devices.begin(), devices.end());
+                std::set<std::string> used;
+                std::vector<Radio*> order;
+                if (preferred >= 0 && preferred < (int)radios.size()) { order.push_back(radios[preferred].get()); }
+                for (auto& r : radios) {
+                    if (r->id != preferred) { order.push_back(r.get()); }
+                }
+
+                std::vector<Radio*> unbound;
+                for (Radio* r : order) {
+                    std::string id = r->handler->selectedDeviceHandler(r->handler->ctx);
+                    if (!id.empty() && available.count(id) && !used.count(id)) {
+                        r->device = id;
+                        r->online = true;
+                        used.insert(id);
+                    }
+                    else {
+                        unbound.push_back(r);
+                    }
+                }
+                std::sort(unbound.begin(), unbound.end(), [](Radio* l, Radio* r) { return l->id < r->id; });
+
+                Radio* prevActive = activeRadio;
+                for (Radio* r : unbound) {
+                    r->device = "";
+                    r->online = false;
+                    for (auto& id : devices) {
+                        if (used.count(id)) { continue; }
+                        used.insert(id); // Not tried again by the next radio if it cannot be opened
+                        activeRadio = r;
+                        bool ok = r->handler->selectDeviceHandler(id, r->handler->ctx);
+                        activeRadio = prevActive;
+                        if (ok) {
+                            r->device = id;
+                            r->online = true;
+                            break;
+                        }
+                    }
+                    if (!r->online) { flog::warn("Web monitor: radio {0} has no device", r->id + 1); }
                 }
             }
 
@@ -123,6 +238,8 @@ namespace web {
                 if (running) { return; }
                 if (bands.empty()) { throw std::runtime_error("Add a band first"); }
                 if (radios.empty()) { throw std::runtime_error("No radio available. Is the " + sourceType().name + " module built and in the modules directory?"); }
+                bool anyOnline = std::any_of(radios.begin(), radios.end(), [](const std::unique_ptr<Radio>& r) { return r->online; });
+                if (!anyOnline) { throw std::runtime_error("No " + sourceType().name + " connected. Plug one in, it is picked up automatically."); }
                 int dwellMs = config.conf["dwellMs"].get<int>();
                 int settleMs = config.conf["settleMs"].is_number() ? config.conf["settleMs"].get<int>() : sourceType().settleMs;
                 for (auto& r : radios) { r->start(dwellMs, settleMs); }
@@ -170,7 +287,90 @@ namespace web {
 
                     radios.push_back(std::move(radio));
                 }
+                assignDevices();
                 assignBands();
+            }
+
+            // One radio per connected device, as on launch. The operator can still add or remove radios afterwards.
+            void autoConfigure() {
+                devices.clear(); // May be from another source type
+                buildRadios(); // The module instances are needed to list the devices
+                if (!canManageDevices()) { return; }
+                scanDevices();
+                int found = std::min<int>((int)devices.size(), MAX_RADIOS);
+                if (found == 0) {
+                    assignDevices();
+                    assignBands();
+                    notify("No " + sourceType().name + " found. Plug one in, it is picked up automatically.");
+                    return;
+                }
+                if (found != config.conf["radioCount"].get<int>()) {
+                    config.conf["radioCount"] = found;
+                    saveConfig();
+                    buildRadios();
+                }
+                else {
+                    assignDevices();
+                    assignBands();
+                }
+                notify(std::to_string(found) + " " + sourceType().name + (found > 1 ? " devices" : " device") + " found, " +
+                       std::to_string(found) + (found > 1 ? " radios" : " radio") + " set up");
+            }
+
+            // Called by the watcher: adds a radio for each newly plugged device, or gives it to a radio without one
+            void checkNewDevices() {
+                std::lock_guard<std::recursive_mutex> lck(mtx);
+                if (!canManageDevices()) { return; }
+                std::vector<std::string> now = listDevices();
+                std::vector<std::string> fresh;
+                for (auto& id : now) {
+                    if (lastSeen.count(id)) { continue; }
+                    bool inUse = std::any_of(radios.begin(), radios.end(), [&](const std::unique_ptr<Radio>& r) { return r->online && r->device == id; });
+                    if (!inUse) { fresh.push_back(id); }
+                }
+                lastSeen = std::set<std::string>(now.begin(), now.end());
+                if (fresh.empty()) { return; }
+
+                bool wasRunning = running;
+                stopLocked();
+                scanDevices();
+
+                int offline = (int)std::count_if(radios.begin(), radios.end(), [](const std::unique_ptr<Radio>& r) { return !r->online; });
+                int count = std::min<int>((int)radios.size() + std::max<int>(0, (int)fresh.size() - offline), MAX_RADIOS);
+                if (count != (int)radios.size()) {
+                    config.conf["radioCount"] = count;
+                    saveConfig();
+                    buildRadios();
+                }
+                else {
+                    assignDevices();
+                    assignBands();
+                }
+
+                for (auto& id : fresh) {
+                    auto it = std::find_if(radios.begin(), radios.end(), [&](const std::unique_ptr<Radio>& r) { return r->online && r->device == id; });
+                    if (it != radios.end()) {
+                        notify("New " + sourceType().name + " connected (" + shortId(id) + "), used as Radio " + std::to_string((*it)->id + 1));
+                    }
+                    else {
+                        notify("New " + sourceType().name + " connected (" + shortId(id) + "), but it could not be used");
+                    }
+                }
+
+                if (wasRunning) {
+                    try { startLocked(); }
+                    catch (const std::exception& e) { lastError = e.what(); }
+                }
+            }
+
+            void watchDevices() {
+                while (true) {
+                    {
+                        std::unique_lock<std::mutex> lck(watcherMtx);
+                        if (watcherCnd.wait_for(lck, WATCH_INTERVAL, [] { return !watching; })) { return; }
+                    }
+                    checkNewDevices();
+                }
             }
 
             json listNames(const std::string& dir) {
@@ -221,6 +421,7 @@ namespace web {
 
             for (auto& b : config.conf["bands"]) {
                 auto band = std::make_shared<Band>(b["id"].get<int>(), b["name"].get<std::string>(), b["frequency"].get<double>());
+                band->radioSetting = b.value("radioSetting", -1);
                 band->onFrame = [](const std::string& frame) {
                     std::lock_guard<std::mutex> lck(frameHandlerMtx);
                     if (frameHandler) { frameHandler(frame); }
@@ -230,10 +431,20 @@ namespace web {
             }
 
             core::webSampleRateHandler = onSampleRate;
-            buildRadios();
+            autoConfigure();
+
+            watching = true;
+            watcher = std::thread(watchDevices);
         }
 
         void shutdown() {
+            {
+                std::lock_guard<std::mutex> lck(watcherMtx);
+                watching = false;
+            }
+            watcherCnd.notify_all();
+            if (watcher.joinable()) { watcher.join(); }
+
             std::lock_guard<std::recursive_mutex> lck(mtx);
             stopLocked();
             radios.clear();
@@ -272,6 +483,7 @@ namespace web {
                                            { "name", b->name },
                                            { "frequency", b->frequency },
                                            { "radio", r ? r->id : -1 },
+                                           { "radioSetting", (b->radioSetting >= 0 && b->radioSetting < (int)radios.size()) ? b->radioSetting : -1 },
                                            { "sampleRate", r ? r->getSampleRate() : 0.0 } });
             }
 
@@ -285,7 +497,9 @@ namespace web {
                                             { "name", r->sourceName },
                                             { "sampleRate", r->getSampleRate() },
                                             { "bands", ids },
-                                            { "receiving", receiving } });
+                                            { "receiving", receiving },
+                                            { "device", r->device },
+                                            { "online", r->online } });
                 if (running && !r->bands.empty() && !receiving && !r->isStarting() && error.empty()) {
                     error = "No data from radio " + std::to_string(r->id + 1) + " (" + r->sourceName + "). Check that the device is connected and selected in the Source menu.";
                 }
@@ -295,6 +509,7 @@ namespace web {
                 error = "Only " + std::to_string(radios.size()) + " of " + std::to_string(wanted) + " radios could be set up";
             }
             state["error"] = error;
+            state["notices"] = json(std::vector<json>(notices.begin(), notices.end()));
 
             json display;
             for (auto key : { "fftSize", "fftRate", "fftWindow", "showWaterfall", "fftHold", "fftHoldSpeed", "fftSmoothing", "fftSmoothingSpeed", "colorMap", "theme", "min", "max" }) {
@@ -311,6 +526,12 @@ namespace web {
 
         void start() {
             std::lock_guard<std::recursive_mutex> lck(mtx);
+            if (!running) {
+                // Pick up devices that were unplugged or plugged since the last scan
+                scanDevices();
+                assignDevices();
+                assignBands();
+            }
             startLocked();
         }
 
@@ -322,6 +543,7 @@ namespace web {
         void setSetup(const json& setup) {
             std::lock_guard<std::recursive_mutex> lck(mtx);
             bool rebuild = false;
+            bool typeChanged = false;
 
             if (setup.contains("sourceType")) {
                 std::string id = setup["sourceType"].get<std::string>();
@@ -331,6 +553,7 @@ namespace web {
                     config.conf["sourceType"] = id;
                     config.conf["settleMs"] = nullptr;
                     rebuild = true;
+                    typeChanged = true;
                 }
             }
             if (setup.contains("radioCount")) {
@@ -357,7 +580,10 @@ namespace web {
             saveConfig();
 
             bool wasRunning = running;
-            if (rebuild) {
+            if (typeChanged) {
+                autoConfigure();
+            }
+            else if (rebuild) {
                 buildRadios();
             }
             else if (timing && wasRunning) {
@@ -400,6 +626,17 @@ namespace web {
                 band->frequency = frequency;
                 Radio* r = radioOf(band);
                 if (r) { r->retune(band); }
+            }
+            if (j.contains("radioSetting")) {
+                int radio = j["radioSetting"].get<int>();
+                if (radio < -1 || radio >= (int)radios.size()) { throw std::runtime_error("Radio not found"); }
+                if (radio != band->radioSetting) {
+                    band->radioSetting = radio;
+                    bool wasRunning = running;
+                    stopLocked();
+                    assignBands();
+                    if (wasRunning) { startLocked(); }
+                }
             }
             saveBands();
         }
@@ -472,8 +709,17 @@ namespace web {
                 else if (type == "int") { value.type = SmGui::DRAW_LIST_ELEM_TYPE_INT; value.i = action["value"].get<int>(); }
                 else if (type == "float") { value.type = SmGui::DRAW_LIST_ELEM_TYPE_FLOAT; value.f = action["value"].get<float>(); }
                 else if (type == "string") { value.type = SmGui::DRAW_LIST_ELEM_TYPE_STRING; value.str = action["value"].get<std::string>(); }
-                SmGui::setDiff(action["id"].get<std::string>(), value);
+                std::string id = action["id"].get<std::string>();
+                SmGui::setDiff(id, value);
                 r->handler->menuHandler(r->handler->ctx);
+
+                // The device controls are only enabled while stopped
+                if (!running && canManageDevices()) {
+                    if (id.rfind("Refresh##", 0) == 0) { scanDevices(); }
+                    assignDevices(radio);
+                    assignBands();
+                    activeRadio = r;
+                }
             }
 
             SmGui::DrawList dl;

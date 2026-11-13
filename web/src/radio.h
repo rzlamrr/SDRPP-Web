@@ -47,6 +47,10 @@ namespace web {
         SourceManager::SourceHandler* const handler;
         std::vector<std::shared_ptr<Band>> bands;
 
+        // Device this radio uses and whether it was connected at the last scan. An offline radio gets no bands.
+        std::string device;
+        bool online = true;
+
     private:
         static float* acquireFFTBuffer(void* ctx);
         static void releaseFFTBuffer(void* ctx);

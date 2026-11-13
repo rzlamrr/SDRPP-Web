@@ -16,6 +16,7 @@ interface Band {
   id: number;
   name: string;
   frequency: number;
+  radioSetting: number;
   view: { offset: number; bandwidth: number; points: number };
   hold: Float32Array | null;
 }
@@ -28,6 +29,7 @@ interface Radio {
   bwId: number;
   clkId: number;
   ppm: number;
+  device: string; // Empty when the radio has no device
 }
 
 const SOURCE_TYPES = [
@@ -90,22 +92,91 @@ export function mockBackend(): Plugin {
   };
   let bands: Band[] = [];
   let radios: Radio[] = [];
+  // Simulated devices plugged in. Change them with PUT /api/mock/devices { devices: ["SIM1", ...] }.
+  let connected = ["SIM00000000000001", "SIM00000000000002"];
+  let lastSeen = new Set(connected);
+  const notices: { id: number; text: string }[] = [];
+  let noticeId = 0;
+  const notify = (text: string) => {
+    notices.push({ id: ++noticeId, text });
+    if (notices.length > 10) notices.shift();
+  };
   const clients = new Set<WebSocket>();
   let timer: NodeJS.Timeout | null = null;
 
   const type = () => SOURCE_TYPES.find((t) => t.id === config.sourceType)!;
   const settle = () => config.settleMs ?? type().settleMs;
-  const newBand = (id: number, name: string, frequency: number): Band => ({ id, name, frequency, view: { offset: 0, bandwidth: 0, points: 1024 }, hold: null });
-  const newRadio = (): Radio => ({ srId: type().defRate, gainMode: 1, gain: 30, biasT: false, bwId: 0, clkId: 0, ppm: 0 });
-  const radioOf = (index: number) => (radios.length ? index % radios.length : -1);
+  const newBand = (id: number, name: string, frequency: number): Band => ({ id, name, frequency, radioSetting: -1, view: { offset: 0, bandwidth: 0, points: 1024 }, hold: null });
+  const newRadio = (): Radio => ({ srId: type().defRate, gainMode: 1, gain: 30, biasT: false, bwId: 0, clkId: 0, ppm: 0, device: "" });
+  const online = (r: Radio | undefined) => !!r && r.device !== "";
+  const isTied = (b: Band) => b.radioSetting >= 0 && b.radioSetting < radios.length && online(radios[b.radioSetting]);
+  // Same rule as assignBands in web/src/engine.cpp: radio of each band, in band order
+  function assignment(): number[] {
+    const counts = radios.map((r) => (online(r) ? 0 : Infinity));
+    const result = bands.map((b) => (isTied(b) ? b.radioSetting : -1));
+    for (const r of result) if (r >= 0) counts[r]++;
+    bands.forEach((b, i) => {
+      if (isTied(b) || !radios.some(online)) return;
+      result[i] = counts.indexOf(Math.min(...counts));
+      counts[result[i]]++;
+    });
+    return result;
+  }
+  // Same rule as assignDevices in web/src/engine.cpp
+  function assignDevices(preferred = -1) {
+    const used = new Set<string>();
+    const order = [...radios.keys()].sort((a, b) => (a === preferred ? -1 : b === preferred ? 1 : a - b));
+    const unbound: number[] = [];
+    for (const i of order) {
+      const d = radios[i].device;
+      if (d && connected.includes(d) && !used.has(d)) used.add(d);
+      else unbound.push(i);
+    }
+    for (const i of unbound.sort((a, b) => a - b)) {
+      radios[i].device = connected.find((d) => !used.has(d)) ?? "";
+      if (radios[i].device) used.add(radios[i].device);
+    }
+  }
+  function autoConfigure() {
+    lastSeen = new Set(connected);
+    if (connected.length === 0) {
+      buildRadios();
+      notify(`No ${type().name} found. Plug one in, it is picked up automatically.`);
+      return;
+    }
+    config.radioCount = Math.min(connected.length, 8);
+    buildRadios();
+    const n = config.radioCount;
+    notify(`${n} ${type().name} ${n > 1 ? "devices" : "device"} found, ${n} ${n > 1 ? "radios" : "radio"} set up`);
+  }
+  // The watcher of web/src/engine.cpp
+  function checkNewDevices() {
+    const fresh = connected.filter((d) => !lastSeen.has(d) && !radios.some((r) => r.device === d));
+    lastSeen = new Set(connected);
+    if (fresh.length === 0) return;
+    const offline = radios.filter((r) => !online(r)).length;
+    const count = Math.min(radios.length + Math.max(0, fresh.length - offline), 8);
+    if (count !== radios.length) {
+      config.radioCount = count;
+      buildRadios();
+    } else {
+      assignDevices();
+    }
+    for (const d of fresh) {
+      const i = radios.findIndex((r) => r.device === d);
+      notify(i >= 0 ? `New ${type().name} connected (${d}), used as Radio ${i + 1}` : `New ${type().name} connected (${d}), but it could not be used`);
+    }
+  }
+  const radioOf = (index: number) => assignment()[index] ?? -1;
   const bandsOf = (radio: number) => bands.filter((_, i) => radioOf(i) === radio);
   const rate = (radio: number) => type().rates[radios[radio]?.srId ?? 0];
 
   function buildRadios() {
-    radios = Array.from({ length: config.radioCount }, newRadio);
+    radios = Array.from({ length: config.radioCount }, (_, i) => radios[i] ?? newRadio());
+    assignDevices();
   }
   bands = [newBand(1, "Band 1", 100e6)];
-  buildRadios();
+  autoConfigure();
 
   function state() {
     return {
@@ -115,9 +186,10 @@ export function mockBackend(): Plugin {
       radioCount: config.radioCount,
       dwellMs: config.dwellMs,
       settleMs: settle(),
-      bands: bands.map((b, i) => ({ id: b.id, name: b.name, frequency: b.frequency, radio: radioOf(i), sampleRate: rate(radioOf(i)) })),
-      radios: radios.map((_, i) => ({ id: i, name: i === 0 ? type().name : `${type().name} Source #${i + 1}`, sampleRate: rate(i), bands: bandsOf(i).map((b) => b.id), receiving: config.running })),
+      bands: bands.map((b, i) => ({ id: b.id, name: b.name, frequency: b.frequency, radio: radioOf(i), radioSetting: b.radioSetting < radios.length ? b.radioSetting : -1, sampleRate: rate(radioOf(i)) })),
+      radios: radios.map((_, i) => ({ id: i, name: i === 0 ? type().name : `${type().name} Source #${i + 1}`, sampleRate: rate(i), bands: bandsOf(i).map((b) => b.id), receiving: config.running && bandsOf(i).length > 0, device: radios[i].device, online: online(radios[i]) })),
       error: "",
+      notices,
       display: config.display,
       fftSizes: [524288, 262144, 131072, 65536, 32768, 16384, 8192, 4096, 2048, 1024],
       colorMaps: listNames(path.join(RES_DIR, "colormaps")),
@@ -148,7 +220,12 @@ export function mockBackend(): Plugin {
 
     if (config.running) step(STEP.BEGIN_DISABLED);
     step(STEP.FILL);
-    step(STEP.COMBO, `##_dev_sel_${sfx}`, 0, `SIMULATED${index + 1}\0`, -1);
+    if (hit(`##_dev_sel_${sfx}`)) {
+      r.device = connected[Number(action!.value)] ?? r.device;
+      assignDevices(index);
+    }
+    if (hit(`Refresh##_refr_${sfx}`)) assignDevices(index);
+    step(STEP.COMBO, `##_dev_sel_${sfx}`, connected.indexOf(r.device), connected.join("\0") + "\0", -1);
     combo(`##_sr_sel_${sfx}`, "srId", t.rates.map(rateText));
     step(STEP.SAME_LINE);
     step(STEP.FILL);
@@ -259,6 +336,9 @@ export function mockBackend(): Plugin {
     if (url === "/api/state") return state();
     if (url === "/api/start" && method === "POST") {
       if (bands.length === 0) throw new Error("Add a band first");
+      lastSeen = new Set(connected);
+      assignDevices();
+      if (!radios.some(online)) throw new Error(`No ${type().name} connected. Plug one in, it is picked up automatically.`);
       config.running = true;
     } else if (url === "/api/stop" && method === "POST") {
       config.running = false;
@@ -267,7 +347,7 @@ export function mockBackend(): Plugin {
         if (!SOURCE_TYPES.some((t) => t.id === body.sourceType)) throw new Error("Unknown source type");
         config.sourceType = body.sourceType;
         config.settleMs = null;
-        buildRadios();
+        autoConfigure();
       }
       if (body.radioCount !== undefined) {
         if (body.radioCount < 1 || body.radioCount > 8) throw new Error("Radio count must be between 1 and 8");
@@ -292,7 +372,14 @@ export function mockBackend(): Plugin {
     } else if ((m = url.match(/^\/api\/bands\/(\d+)$/))) {
       const b = band(Number(m[1]));
       if (method === "DELETE") bands = bands.filter((x) => x !== b);
-      else Object.assign(b, body.name !== undefined ? { name: body.name } : {}, body.frequency !== undefined ? { frequency: body.frequency } : {});
+      else {
+        if (body.radioSetting !== undefined && (body.radioSetting < -1 || body.radioSetting >= radios.length)) throw new Error("Radio not found");
+        for (const key of ["name", "frequency", "radioSetting"] as const) {
+          if (body[key] !== undefined) Object.assign(b, { [key]: body[key] });
+        }
+      }
+    } else if (url === "/api/mock/devices" && method === "PUT") {
+      connected = body.devices;
     } else if ((m = url.match(/^\/api\/radios\/(\d+)\/menu$/))) {
       return menu(Number(m[1]), method === "POST" ? body : null);
     } else {
@@ -305,6 +392,7 @@ export function mockBackend(): Plugin {
     name: "sdrpp-mock-backend",
     configureServer(server) {
       restartTimer();
+      setInterval(checkNewDevices, 3000);
 
       server.middlewares.use((req: IncomingMessage, res: ServerResponse, next: () => void) => {
         const url = (req.url ?? "").split("?")[0];

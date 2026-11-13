@@ -158,7 +158,8 @@ menuHost.append(sourceSection.root, bandsSection.root, displaySection.root, them
 
 const sourceTypeHost = el("div");
 const radiosHost = el("div");
-sourceSection.body.append(sourceTypeHost, radiosHost);
+const radioButtonsHost = el("div");
+sourceSection.body.append(sourceTypeHost, radiosHost, radioButtonsHost);
 
 let menus: Menu[] = [];
 const radioHosts: HTMLDivElement[] = [];
@@ -180,6 +181,18 @@ function renderSourceType() {
   sourceTypeHost.replaceChildren(row(select));
 }
 
+// Each radio is one more instance of the source module. The server refuses a count it does not support.
+function renderRadioButtons() {
+  const add = button("Add Radio", () => run(() => api.setSetup({ radioCount: state.radioCount + 1 })));
+  add.title = "Use one more radio of this type";
+  const remove = button("Remove Radio", () => run(() => api.setSetup({ radioCount: state.radioCount - 1 })));
+  remove.title = "Stop using the last radio";
+  if (state.radioCount <= 1) remove.classList.add("im-disabled");
+  add.classList.add("im-fill");
+  remove.classList.add("im-fill");
+  radioButtonsHost.replaceChildren(row(add, remove));
+}
+
 function renderRadios() {
   // Replacing a slider while it is being dragged would drop the drag
   if (menuPointerDown) {
@@ -190,10 +203,12 @@ function renderRadios() {
   radiosHost.replaceChildren();
   radioHosts.length = 0;
   menus.forEach((menu, i) => {
-    if (menus.length > 1) {
-      const radioState = state.radios[i];
+    const radioState = state.radios[i];
+    const offline = radioState && !radioState.online;
+    if (menus.length > 1 || offline) {
       const names = (radioState?.bands ?? []).map((id) => state.bands.find((b) => b.id === id)?.name ?? `#${id}`);
-      radiosHost.append(el("div", "im-separator-text", `Radio ${i + 1}${names.length ? `: ${names.join(", ")}` : " (no band)"}`));
+      const what = offline ? " (no device connected)" : names.length ? `: ${names.join(", ")}` : " (no band)";
+      radiosHost.append(el("div", "im-separator-text", `Radio ${i + 1}${what}`));
     }
     const host = el("div", "radio-menu");
     renderMenu(host, menu, (action) =>
@@ -227,7 +242,6 @@ function renderBands() {
   const body = bandsSection.body;
   body.replaceChildren();
   body.append(
-    leftLabel("Radios", inputInt(state.radioCount, 1, (v) => run(() => api.setSetup({ radioCount: v })))),
     leftLabel("Dwell (ms)", inputInt(state.dwellMs, 10, (v) => run(() => api.setSetup({ dwellMs: v })))),
     leftLabel("Settle (ms)", inputInt(state.settleMs, 5, (v) => run(() => api.setSetup({ settleMs: v })))),
   );
@@ -235,7 +249,17 @@ function renderBands() {
     const select = radio("", band.id === selected, () => selectBand(band.id));
     const name = inputText(band.name, (v) => run(() => api.updateBand(band.id, { name: v })));
     name.classList.add("im-fill");
-    const tag = el("span", "im-text band-radio", band.radio >= 0 ? `R${band.radio + 1}` : "-");
+    const radioName = band.radio >= 0 ? `R${band.radio + 1}` : "-";
+    let tag: HTMLElement;
+    if (state.radios.length > 1) {
+      // The first entry leaves the choice to the monitor and shows the radio it picked
+      const tied = band.radioSetting >= 0;
+      const items = [tied ? "Auto" : `Auto (${radioName})`, ...state.radios.map((r) => `R${r.id + 1}${r.online ? "" : " (offline)"}`)];
+      tag = combo(items, tied ? band.radioSetting + 1 : 0, (i) => run(() => api.updateBand(band.id, { radioSetting: i - 1 })));
+      tag.classList.add("band-radio-select");
+    } else {
+      tag = el("span", "im-text band-radio", radioName);
+    }
     tag.title = "Radio this band is received with";
     const remove = button("X", () => run(() => api.removeBand(band.id)));
     remove.title = "Remove this band";
@@ -348,6 +372,28 @@ function syncPanes() {
 
 // --- state ---------------------------------------------------------------------------------
 
+// Messages of the monitor, such as a newly plugged device. Those from before the page was opened are not shown.
+let lastNotice = 0;
+function showNotices(s: State, first: boolean) {
+  const notices = s.notices ?? [];
+  const latestId = notices.length ? notices[notices.length - 1].id : 0;
+  // A restarted monitor counts from 1 again
+  if (first || latestId < lastNotice) {
+    lastNotice = latestId;
+    return;
+  }
+  for (const n of notices) {
+    if (n.id <= lastNotice) continue;
+    const toast = el("div", "notice", n.text);
+    const close = () => toast.remove();
+    toast.title = "Click to close";
+    toast.addEventListener("click", close);
+    $("notices").append(toast);
+    setTimeout(close, 10000);
+  }
+  lastNotice = latestId;
+}
+
 function showError() {
   const banner = $("error");
   const message = !connected ? "Lost connection to the monitor. Retrying..." : actionError || state?.error || "";
@@ -366,14 +412,15 @@ async function run(action: () => Promise<State>, clearError = true) {
     showError();
     // Controls may show a value the server refused
     renderSourceType();
+    renderRadioButtons();
     renderBands();
     renderDisplay();
   }
 }
 
 const part = {
-  source: (s: State) => JSON.stringify([s.running, s.sourceType, s.radios.map((r) => [r.id, r.name, r.sampleRate, r.bands])]),
-  bands: (s: State) => JSON.stringify([s.bands, s.radioCount, s.dwellMs, s.settleMs]),
+  source: (s: State) => JSON.stringify([s.running, s.sourceType, s.radioCount, s.radios.map((r) => [r.id, r.name, r.sampleRate, r.bands, r.device, r.online])]),
+  bands: (s: State) => JSON.stringify([s.bands, s.radios.map((r) => r.online), s.dwellMs, s.settleMs]),
   display: (s: State) => JSON.stringify([s.display, s.fftSizes, s.colorMaps]),
 };
 
@@ -415,6 +462,7 @@ async function applyState(next: State) {
 
   if (!prev || part.source(prev) !== part.source(next)) {
     renderSourceType();
+    renderRadioButtons();
     await refreshMenus();
   }
 
@@ -422,6 +470,8 @@ async function applyState(next: State) {
     settings.running = next.running;
     panes.forEach((p) => p.queueDraw());
   }
+
+  showNotices(next, !prev);
 
   const icon = $<HTMLImageElement>("playIcon");
   icon.src = next.running ? "res/icons/stop.png" : "res/icons/play.png";

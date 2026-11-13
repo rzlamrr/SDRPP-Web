@@ -19,6 +19,15 @@ public:
         void (*stopHandler)(void* ctx);
         void (*tuneHandler)(double freq, void* ctx);
         void* ctx;
+
+        // Optional device management, used by the web monitor to give each radio its own device.
+        // Modules that do not set them are treated as always having their device.
+        // Ids of the connected devices this process can open now (an open device may be left out). Does not change the selection.
+        std::vector<std::string> (*listDevicesHandler)(void* ctx) = NULL;
+        // Selects a device by id, false if it is not connected. Only called while stopped.
+        bool (*selectDeviceHandler)(std::string id, void* ctx) = NULL;
+        // Id of the selected device, empty if none
+        std::string (*selectedDeviceHandler)(void* ctx) = NULL;
     };
 
     enum TuningMode {
