@@ -1,5 +1,6 @@
 #include "band.h"
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstring>
 
@@ -35,44 +36,95 @@ namespace web {
                 put<int16_t>(out, pos, (int16_t)std::clamp<float>(c, -32768.0f, 32767.0f));
             }
         }
+
+        int64_t wallMs() {
+            return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+        }
     }
 
-    Band::Band(int id, std::string name, double frequency) : id(id), name(name), frequency(frequency) {}
+    Band::Band(int id, std::string name, double frequency) : id(id), name(name), frequency(frequency) {
+        detector.bandId = id;
+    }
+
+    // Hands the events that ended to the engine. Must be called without the lock held.
+    void Band::emitClosed() {
+        std::vector<InterferenceEvent> events;
+        {
+            std::lock_guard<std::mutex> lck(mtx);
+            events.swap(closedEvents);
+        }
+        if (onEventClosed) {
+            for (auto& e : events) { onEventClosed(e); }
+        }
+    }
+
+    void Band::setDetection(const DetectorSettings& settings) {
+        {
+            std::lock_guard<std::mutex> lck(mtx);
+            detector.setSettings(settings, closedEvents);
+        }
+        emitClosed();
+    }
+
+    void Band::relearn() {
+        {
+            std::lock_guard<std::mutex> lck(mtx);
+            detector.relearn(wallMs(), closedEvents);
+        }
+        emitClosed();
+    }
+
+    void Band::closeEvents() {
+        {
+            std::lock_guard<std::mutex> lck(mtx);
+            detector.closeAll(wallMs(), closedEvents);
+        }
+        emitClosed();
+    }
+
+    void Band::detection(std::vector<InterferenceEvent>& active, DetectorStatus& status) {
+        std::lock_guard<std::mutex> lck(mtx);
+        active = detector.activeEvents();
+        status = detector.status();
+    }
 
     void Band::setView(double offset, double bandwidth, int points) {
         std::lock_guard<std::mutex> lck(mtx);
         viewOffset = offset;
         viewBandwidth = bandwidth;
         this->points = std::clamp<int>(points, 64, 4096);
-        historyValid = false;
     }
 
     void Band::resetView() {
         std::lock_guard<std::mutex> lck(mtx);
         viewOffset = 0.0;
         viewBandwidth = 0.0;
-        historyValid = false;
     }
 
     void Band::setFFTHold(bool enabled, float speed) {
         std::lock_guard<std::mutex> lck(mtx);
+        // Only switching it on starts it over: the Display menu sends every setting on each change
+        if (enabled && !fftHold) { holdValid = false; }
         fftHold = enabled;
         fftHoldSpeed = speed;
-        historyValid = false;
     }
 
     void Band::setFFTSmoothing(bool enabled, float speed) {
         std::lock_guard<std::mutex> lck(mtx);
+        if (enabled && !fftSmoothing) { smoothingValid = false; }
         fftSmoothing = enabled;
         smoothingAlpha = std::clamp<float>(speed, 0.0f, 1.0f);
-        historyValid = false;
     }
 
     void Band::pushFFT(const float* raw, int rawSize, double bandwidth) {
         std::string frame;
+        bool anyClosed = false;
         {
             std::lock_guard<std::mutex> lck(mtx);
             if (rawSize <= 0 || bandwidth <= 0) { return; }
+
+            detector.process(raw, rawSize, frequency, bandwidth, wallMs(), closedEvents);
+            anyClosed = !closedEvents.empty();
 
             // Resolve the view against the current bandwidth
             double vbw = (viewBandwidth <= 0.0 || viewBandwidth > bandwidth) ? bandwidth : viewBandwidth;
@@ -84,29 +136,47 @@ namespace web {
 
             if ((int)latest.size() != points) {
                 latest.assign(points, -INFINITY);
-                smoothed.assign(points, -INFINITY);
                 hold.assign(points, -INFINITY);
-                historyValid = false;
             }
-            doZoom(start, size, rawSize, points, raw, latest.data());
 
-            // FFT smoothing and hold, same behaviour as WaterFall::pushFFT
+            // A different spectrum makes the history meaningless
+            if (frequency != historyFrequency || bandwidth != historyBandwidth || (int)rawSmoothed.size() != rawSize) {
+                historyFrequency = frequency;
+                historyBandwidth = bandwidth;
+                rawSmoothed.resize(rawSize);
+                rawHold.resize(rawSize);
+                smoothingValid = false;
+                holdValid = false;
+            }
+
+            // FFT smoothing and hold, same behaviour as WaterFall::pushFFT, on the whole FFT
+            const float* line = raw;
             if (fftSmoothing) {
-                if (!historyValid) { smoothed = latest; }
-                float beta = 1.0f - smoothingAlpha;
-                for (int i = 0; i < points; i++) {
-                    smoothed[i] = (smoothed[i] * beta) + (latest[i] * smoothingAlpha);
-                    if (!std::isfinite(smoothed[i])) { smoothed[i] = latest[i]; }
+                if (!smoothingValid) {
+                    std::copy(raw, raw + rawSize, rawSmoothed.begin());
+                    smoothingValid = true;
                 }
-                latest = smoothed;
+                else {
+                    float beta = 1.0f - smoothingAlpha;
+                    for (int i = 0; i < rawSize; i++) {
+                        float v = (rawSmoothed[i] * beta) + (raw[i] * smoothingAlpha);
+                        rawSmoothed[i] = std::isfinite(v) ? v : raw[i];
+                    }
+                }
+                line = rawSmoothed.data();
             }
             if (fftHold) {
-                if (!historyValid) { hold = latest; }
-                for (int i = 0; i < points; i++) {
-                    hold[i] = std::max<float>(latest[i], hold[i] - fftHoldSpeed);
+                if (!holdValid) {
+                    std::copy(line, line + rawSize, rawHold.begin());
+                    holdValid = true;
+                }
+                else {
+                    for (int i = 0; i < rawSize; i++) { rawHold[i] = std::max<float>(line[i], rawHold[i] - fftHoldSpeed); }
                 }
             }
-            historyValid = true;
+
+            doZoom(start, size, rawSize, points, line, latest.data());
+            if (fftHold) { doZoom(start, size, rawSize, points, rawHold.data(), hold.data()); }
 
             // Signal to noise ratio of what is in view: peak over the lower quartile
             scratch = latest;
@@ -131,5 +201,6 @@ namespace web {
             if (fftHold) { putLine(frame, pos, hold); }
         }
         if (onFrame) { onFrame(frame); }
+        if (anyClosed) { emitClosed(); }
     }
 }

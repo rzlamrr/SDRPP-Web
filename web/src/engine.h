@@ -33,6 +33,14 @@ namespace web {
         // otherwise { id, type: "void"|"bool"|"int"|"float"|"string", value }.
         nlohmann::json getMenu(int radio, const nlohmann::json& action);
 
+        // Interference detection: settings, per band status, active events and the latest ended ones
+        nlohmann::json getInterference();
+        // Partial update of { enabled, thresholdDb, noiseRiseDb, learnSeconds, adaptMinutes }
+        void setInterference(const nlohmann::json& settings);
+        // Learn the baseline of one band again, or of every band with -1
+        void relearn(int band);
+        void clearHistory();
+
         std::string resourcesDirectory();
     }
 }

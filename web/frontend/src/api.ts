@@ -28,6 +28,8 @@ export interface Display {
   fftHoldSpeed: number;
   fftSmoothing: boolean;
   fftSmoothingSpeed: number;
+  fftMode: "line" | "persistence"; // Persistence draws how often each level occurs instead of one line
+  persistenceSpeed: number; // How fast the persistence fades, 1 to 100
   colorMap: string;
   theme: string;
   min: number;
@@ -97,3 +99,62 @@ export const getMenu = (radio: number) => request<Menu>(`api/radios/${radio}/men
 export const menuAction = (radio: number, action: MenuAction) =>
   request<Menu>(`api/radios/${radio}/menu`, "POST", action);
 export const getJson = <T>(url: string) => request<T>(url);
+
+// --- interference detection (web/src/detector.h) ---
+
+export type InterferenceType = "narrowband" | "wideband" | "swept" | "pulsed" | "noise";
+
+export interface InterferenceEvent {
+  id: number;
+  band: number;
+  type: InterferenceType;
+  active: boolean;
+  start: number; // ms since the epoch
+  last: number;
+  end: number; // 0 while active
+  duration: number; // s
+  center: number; // Hz, latest power weighted center
+  low: number; // Hz, latest occupied range
+  high: number;
+  minCenter: number;
+  maxCenter: number;
+  bandwidth: number; // Hz, widest occupied bandwidth seen
+  peak: number | null; // dB
+  excess: number; // dB over the baseline, for "noise" the rise of the noise floor
+  snr: number; // dB over the noise floor
+  duty: number; // % of the received lines in which it was present
+  drift: number; // Hz/s
+  period: number; // ms between appearances, 0 if it did not repeat
+  appearances: number;
+}
+
+export interface InterferenceSettings {
+  enabled: boolean;
+  thresholdDb: number;
+  noiseRiseDb: number;
+  learnSeconds: number;
+  adaptMinutes: number;
+}
+
+export interface DetectorBand {
+  id: number;
+  enabled: boolean;
+  learning: boolean;
+  learnProgress: number; // 0 to 1
+  noiseFloor: number; // dB
+  baselineFloor: number; // dB
+  active: number;
+}
+
+export interface Interference {
+  settings: InterferenceSettings;
+  logFile: string;
+  bands: DetectorBand[];
+  active: InterferenceEvent[];
+  history: InterferenceEvent[]; // Ended events, newest first
+}
+
+export const getInterference = () => request<Interference>("api/interference");
+export const setInterference = (settings: Partial<InterferenceSettings>) => request<Interference>("api/interference", "PUT", settings);
+export const relearn = (band?: number) => request<Interference>("api/interference/learn", "POST", band === undefined ? {} : { band });
+export const clearHistory = () => request<Interference>("api/interference/history", "DELETE");

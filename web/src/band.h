@@ -4,6 +4,7 @@
 #include <mutex>
 #include <functional>
 #include <stdint.h>
+#include "detector.h"
 
 namespace web {
     // Wire format of one FFT line sent to the browser (little endian):
@@ -29,6 +30,12 @@ namespace web {
         void setFFTHold(bool enabled, float speed);
         void setFFTSmoothing(bool enabled, float speed);
 
+        // Interference detection on the whole band, independent of the view
+        void setDetection(const DetectorSettings& settings);
+        void relearn();
+        void closeEvents();
+        void detection(std::vector<InterferenceEvent>& active, DetectorStatus& status);
+
         const int id;
         std::string name;
         double frequency;
@@ -38,6 +45,9 @@ namespace web {
 
         // Receives every encoded frame
         std::function<void(const std::string&)> onFrame;
+
+        // Receives every interference event that ended, called without the band lock held
+        std::function<void(const InterferenceEvent&)> onEventClosed;
 
     private:
         std::mutex mtx;
@@ -49,11 +59,21 @@ namespace web {
         float fftHoldSpeed = 0.3f;
         bool fftSmoothing = false;
         float smoothingAlpha = 0.5f;
-        bool historyValid = false;
+        // Smoothing and hold run on the whole FFT before the view is cut out, so changing the view keeps them.
+        // They start over when switched on or when the spectrum changes (frequency, bandwidth or FFT size).
+        bool smoothingValid = false;
+        bool holdValid = false;
+        double historyFrequency = 0.0;
+        double historyBandwidth = 0.0;
+        std::vector<float> rawSmoothed;
+        std::vector<float> rawHold;
 
         std::vector<float> latest;
-        std::vector<float> smoothed;
         std::vector<float> hold;
         std::vector<float> scratch;
+
+        Detector detector;
+        std::vector<InterferenceEvent> closedEvents;
+        void emitClosed();
     };
 }

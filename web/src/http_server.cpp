@@ -153,6 +153,27 @@ namespace web {
             return api(req, [&](const json& body) { return engine::getMenu(radio, body); });
         });
 
+        CROW_ROUTE(app, "/api/interference").methods(crow::HTTPMethod::Get, crow::HTTPMethod::Put)
+        ([](const crow::request& req) {
+            return api(req, [&](const json& body) {
+                if (req.method == crow::HTTPMethod::Put) { engine::setInterference(body); }
+                return engine::getInterference();
+            });
+        });
+
+        CROW_ROUTE(app, "/api/interference/learn").methods(crow::HTTPMethod::Post)
+        ([](const crow::request& req) {
+            return api(req, [](const json& body) {
+                engine::relearn((body.is_object() && body.contains("band")) ? body["band"].get<int>() : -1);
+                return engine::getInterference();
+            });
+        });
+
+        CROW_ROUTE(app, "/api/interference/history").methods(crow::HTTPMethod::Delete)
+        ([](const crow::request& req) {
+            return api(req, [](const json&) { engine::clearHistory(); return engine::getInterference(); });
+        });
+
         // SDR++ resources (color maps, themes, icons, fonts) and the web interface itself
         CROW_ROUTE(app, "/res/<path>")
         ([resDir](const std::string& path) { return serveFile(resDir, path); });

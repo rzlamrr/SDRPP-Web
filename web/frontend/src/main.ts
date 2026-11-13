@@ -2,8 +2,9 @@
 
 import "./style.css";
 import * as api from "./api";
-import type { Menu, State } from "./api";
+import type { Interference, Menu, State } from "./api";
 import { FreqSelect } from "./freqselect";
+import { InterferenceMenu, hz, typeInfo } from "./interference";
 import { Pane, type PaneSettings } from "./pane";
 import { renderMenu } from "./smgui";
 import { Stream } from "./stream";
@@ -30,6 +31,7 @@ function store(key: string, value: number) {
 }
 
 let state: State;
+let interference: Interference | null = null;
 let selected = stored("sdrpp.selectedBand", 0);
 let connected = true;
 let actionError = "";
@@ -46,6 +48,8 @@ const settings: PaneSettings = {
   running: false,
   dwellMs: 100,
   fftRate: 20,
+  fftMode: "line",
+  persistenceSpeed: 20,
 };
 
 // --- top bar -----------------------------------------------------------------------------
@@ -154,9 +158,10 @@ function syncZoomSlider() {
 const menuHost = $("menu");
 const sourceSection = collapsingHeader("Source");
 const bandsSection = collapsingHeader("Bands");
+const interferenceSection = collapsingHeader("Interference");
 const displaySection = collapsingHeader("Display");
 const themeSection = collapsingHeader("Theme", false);
-menuHost.append(sourceSection.root, bandsSection.root, displaySection.root, themeSection.root);
+menuHost.append(sourceSection.root, bandsSection.root, interferenceSection.root, displaySection.root, themeSection.root);
 
 const sourceTypeHost = el("div");
 const radiosHost = el("div");
@@ -284,6 +289,8 @@ function renderDisplay() {
     row(checkbox("Show Waterfall", d.showWaterfall, (v) => set({ showWaterfall: v }))),
     row(checkbox("FFT Hold", d.fftHold, (v) => set({ fftHold: v }))),
     leftLabel("FFT Hold Speed", inputInt(d.fftHoldSpeed, 1, (v) => set({ fftHoldSpeed: v }))),
+    leftLabel("FFT Mode", combo(["Line", "Persistence"], d.fftMode === "persistence" ? 1 : 0, (i) => set({ fftMode: i === 1 ? "persistence" : "line" }))),
+    leftLabel("Persistence Speed", inputInt(d.persistenceSpeed, 5, (v) => set({ persistenceSpeed: v }))),
     row(checkbox("FFT Smoothing", d.fftSmoothing, (v) => set({ fftSmoothing: v }))),
     leftLabel("FFT Smoothing Speed", inputInt(d.fftSmoothingSpeed, 1, (v) => set({ fftSmoothingSpeed: v }))),
     leftLabel("FFT Framerate", inputInt(d.fftRate, 1, (v) => set({ fftRate: v }))),
@@ -299,6 +306,58 @@ function renderTheme() {
   const select = combo(state.themes.map((t) => t.name), index, (i) => run(() => api.setDisplay({ theme: state.themes[i].name })));
   themeSection.body.replaceChildren(leftLabel("Theme", select));
 }
+
+// --- interference ---------------------------------------------------------------------------
+
+function applyInterference(next: Interference) {
+  interference = next;
+  renderInterference();
+  panes.forEach((p, id) => p.setEvents(next.active.filter((e) => e.band === id)));
+
+  // Count in the top bar, so it is seen with the menu closed too
+  const alerts = $("alerts");
+  const n = next.active.length;
+  alerts.hidden = n === 0;
+  if (n > 0) {
+    const first = next.active[0];
+    alerts.textContent = `${n} interference${n > 1 ? "s" : ""}: ${typeInfo(first.type).label} ${first.type === "noise" ? "" : hz(first.center)}`;
+  }
+}
+
+function renderInterference() {
+  if (interference && state) interferenceMenu.render(interference, state.bands, selected, state.running);
+}
+
+async function runInterference(action: () => Promise<Interference>) {
+  try {
+    applyInterference(await action());
+    actionError = "";
+  } catch (e) {
+    actionError = e instanceof Error ? e.message : String(e);
+    // Show the stored values again instead of the refused ones
+    interferenceMenu.invalidate();
+    renderInterference();
+  }
+  showError();
+}
+
+function focusEvent(e: api.InterferenceEvent) {
+  if (!panes.has(e.band)) return;
+  selectBand(e.band);
+  panes.get(e.band)!.focusRange(e.low, e.high, e.type === "noise");
+}
+
+const interferenceMenu = new InterferenceMenu(interferenceSection.body, {
+  set: (settings) => runInterference(() => api.setInterference(settings)),
+  relearn: (band) => runInterference(() => api.relearn(band)),
+  clear: () => runInterference(() => api.clearHistory()),
+  focus: focusEvent,
+});
+
+$("alerts").addEventListener("click", () => {
+  const first = interference?.active[0];
+  if (first) focusEvent(first);
+});
 
 // Menu width, dragged like the column border in SDR++
 (() => {
@@ -326,6 +385,7 @@ function selectBand(id: number) {
   }
   syncZoomSlider();
   renderBands();
+  renderInterference();
 }
 
 function syncPanes() {
@@ -458,6 +518,8 @@ async function applyState(next: State) {
     settings.min = next.display.min;
     settings.max = next.display.max;
     settings.showWaterfall = next.display.showWaterfall;
+    settings.fftMode = next.display.fftMode ?? "line";
+    settings.persistenceSpeed = next.display.persistenceSpeed ?? 20;
     minSlider.set(settings.min);
     maxSlider.set(settings.max);
     panes.forEach((p) => p.settingsChanged());
@@ -493,6 +555,13 @@ async function poll() {
   } catch {
     connected = false;
     showError();
+  }
+  if (connected) {
+    try {
+      applyInterference(await api.getInterference());
+    } catch {
+      // Shown again with the next poll
+    }
   }
   drawSnr();
   setTimeout(poll, 1000);

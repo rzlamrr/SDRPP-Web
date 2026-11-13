@@ -15,6 +15,8 @@
 #include <vector>
 #include <mutex>
 #include <stdexcept>
+#include <ctime>
+#include <map>
 
 using nlohmann::json;
 
@@ -67,6 +69,13 @@ namespace web {
             bool watching = false;
             const auto WATCH_INTERVAL = std::chrono::seconds(3);
 
+            // Interference events that ended, newest last, and the log file they are also written to.
+            // Guarded by eventsMtx only, since they arrive from the FFT threads.
+            std::mutex eventsMtx;
+            std::deque<json> history;
+            std::map<int, std::string> bandNames;
+            const size_t MAX_HISTORY = 200;
+
             const SourceType& sourceType() {
                 std::string id = config.conf["sourceType"].get<std::string>();
                 for (auto& t : sourceTypes) {
@@ -98,6 +107,100 @@ namespace web {
                 band.setFFTSmoothing(config.conf["fftSmoothing"].get<bool>(), smoothingSpeed());
             }
 
+            DetectorSettings detectorSettings() {
+                const json& d = config.conf["interference"];
+                DetectorSettings s;
+                s.enabled = d.value("enabled", true);
+                s.thresholdDb = d.value("thresholdDb", 10.0f);
+                s.noiseRiseDb = d.value("noiseRiseDb", 3.0f);
+                s.learnSeconds = d.value("learnSeconds", 10.0f);
+                s.adaptMinutes = d.value("adaptMinutes", 5.0f);
+                s.fftRate = config.conf["fftRate"].get<float>();
+                return s;
+            }
+
+            std::string logPath() {
+                return std::filesystem::absolute(core::args["root"].s() + "/interference_log.csv").string();
+            }
+
+            std::string localTime(int64_t ms) {
+                if (ms <= 0) { return ""; }
+                time_t t = (time_t)(ms / 1000);
+                tm local;
+#ifdef _WIN32
+                localtime_s(&local, &t);
+#else
+                localtime_r(&t, &local);
+#endif
+                char buf[32];
+                strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &local);
+                char out[40];
+                snprintf(out, sizeof(out), "%s.%03d", buf, (int)(ms % 1000));
+                return out;
+            }
+
+            json eventJson(const InterferenceEvent& e) {
+                return { { "id", e.id },
+                         { "band", e.bandId },
+                         { "type", e.type },
+                         { "active", e.endMs == 0 },
+                         { "start", e.startMs },
+                         { "last", e.lastMs },
+                         { "end", e.endMs },
+                         { "duration", e.durationSeconds() },
+                         { "center", e.centerHz },
+                         { "low", e.lowHz },
+                         { "high", e.highHz },
+                         { "minCenter", e.minCenterHz },
+                         { "maxCenter", e.maxCenterHz },
+                         { "bandwidth", e.bandwidthHz },
+                         { "peak", e.peakDb },
+                         { "excess", e.excessDb },
+                         { "snr", e.snrDb },
+                         { "duty", e.dutyPercent() },
+                         { "drift", e.driftHzPerSecond() },
+                         { "period", e.periodMs },
+                         { "appearances", e.appearances } };
+            }
+
+            // Called from the FFT threads when an event ends: kept for the browser and appended to the log
+            void recordEvent(const InterferenceEvent& e) {
+                std::lock_guard<std::mutex> lck(eventsMtx);
+                history.push_back(eventJson(e));
+                while (history.size() > MAX_HISTORY) { history.pop_front(); }
+
+                std::string path = logPath();
+                std::error_code ec;
+                bool header = !std::filesystem::exists(path, ec) || std::filesystem::file_size(path, ec) == 0;
+                std::ofstream log(path, std::ios::app);
+                if (!log) { return; }
+                if (header) {
+                    log << "id,band,type,start,end,duration_s,center_hz,low_hz,high_hz,min_center_hz,max_center_hz,bandwidth_hz,"
+                           "peak_db,excess_db,snr_db,duty_percent,drift_hz_per_s,period_ms,appearances\n";
+                }
+                auto it = bandNames.find(e.bandId);
+                std::string name = (it != bandNames.end()) ? it->second : std::to_string(e.bandId);
+                std::string quoted = "\"";
+                for (char c : name) { quoted += (c == '"') ? std::string("\"\"") : std::string(1, c); }
+                quoted += "\"";
+                char nums[512];
+                snprintf(nums, sizeof(nums), "%.3f,%.0f,%.0f,%.0f,%.0f,%.0f,%.0f,%.1f,%.1f,%.1f,%.1f,%.1f,%.0f,%d",
+                         e.durationSeconds(), e.centerHz, e.lowHz, e.highHz, e.minCenterHz, e.maxCenterHz, e.bandwidthHz,
+                         e.peakDb, e.excessDb, e.snrDb, e.dutyPercent(), e.driftHzPerSecond(), e.periodMs, e.appearances);
+                log << e.id << "," << quoted << "," << e.type << "," << localTime(e.startMs) << "," << localTime(e.endMs) << "," << nums << "\n";
+            }
+
+            // Hooks a new band up to the browser stream, the display settings and the detector
+            void setupBand(Band& band) {
+                band.onFrame = [](const std::string& frame) {
+                    std::lock_guard<std::mutex> lck(frameHandlerMtx);
+                    if (frameHandler) { frameHandler(frame); }
+                };
+                band.onEventClosed = recordEvent;
+                applyBandDisplay(band);
+                band.setDetection(detectorSettings());
+            }
+
             std::shared_ptr<Band> findBand(int id) {
                 for (auto& b : bands) {
                     if (b->id == id) { return b; }
@@ -119,6 +222,10 @@ namespace web {
                 }
                 config.conf["bands"] = list;
                 saveConfig();
+
+                std::lock_guard<std::mutex> lck(eventsMtx);
+                bandNames.clear();
+                for (auto& b : bands) { bandNames[b->id] = b->name; }
             }
 
             void notify(const std::string& text) {
@@ -232,6 +339,8 @@ namespace web {
             void stopLocked() {
                 for (auto& r : radios) { r->stop(); }
                 running = false;
+                // Nothing is observed any more, so what was seen ends here
+                for (auto& b : bands) { b->closeEvents(); }
             }
 
             void startLocked() {
@@ -407,10 +516,13 @@ namespace web {
             def["fftHoldSpeed"] = 60;
             def["fftSmoothing"] = false;
             def["fftSmoothingSpeed"] = 100;
+            def["fftMode"] = "line";
+            def["persistenceSpeed"] = 20;
             def["colorMap"] = "Classic";
             def["theme"] = "Dark";
             def["min"] = -120.0;
             def["max"] = 0.0;
+            def["interference"] = { { "enabled", true }, { "thresholdDb", 10.0 }, { "noiseRiseDb", 3.0 }, { "learnSeconds", 10.0 }, { "adaptMinutes", 5.0 } };
             config.setPath(core::args["root"].s() + "/web_config.json");
             config.load(def);
 
@@ -422,12 +534,12 @@ namespace web {
             for (auto& b : config.conf["bands"]) {
                 auto band = std::make_shared<Band>(b["id"].get<int>(), b["name"].get<std::string>(), b["frequency"].get<double>());
                 band->radioSetting = b.value("radioSetting", -1);
-                band->onFrame = [](const std::string& frame) {
-                    std::lock_guard<std::mutex> lck(frameHandlerMtx);
-                    if (frameHandler) { frameHandler(frame); }
-                };
-                applyBandDisplay(*band);
+                setupBand(*band);
                 bands.push_back(band);
+            }
+            {
+                std::lock_guard<std::mutex> elck(eventsMtx);
+                for (auto& b : bands) { bandNames[b->id] = b->name; }
             }
 
             core::webSampleRateHandler = onSampleRate;
@@ -512,7 +624,7 @@ namespace web {
             state["notices"] = json(std::vector<json>(notices.begin(), notices.end()));
 
             json display;
-            for (auto key : { "fftSize", "fftRate", "fftWindow", "showWaterfall", "fftHold", "fftHoldSpeed", "fftSmoothing", "fftSmoothingSpeed", "colorMap", "theme", "min", "max" }) {
+            for (auto key : { "fftSize", "fftRate", "fftWindow", "showWaterfall", "fftHold", "fftHoldSpeed", "fftSmoothing", "fftSmoothingSpeed", "fftMode", "persistenceSpeed", "colorMap", "theme", "min", "max" }) {
                 display[key] = config.conf[key];
             }
             state["display"] = display;
@@ -601,11 +713,7 @@ namespace web {
             int id = 1;
             for (auto& b : bands) { id = std::max<int>(id, b->id + 1); }
             auto band = std::make_shared<Band>(id, j.value("name", "Band " + std::to_string(id)), frequency);
-            band->onFrame = [](const std::string& frame) {
-                std::lock_guard<std::mutex> lck(frameHandlerMtx);
-                if (frameHandler) { frameHandler(frame); }
-            };
-            applyBandDisplay(*band);
+            setupBand(*band);
 
             bool wasRunning = running;
             stopLocked();
@@ -646,6 +754,7 @@ namespace web {
             auto band = findBand(id);
             bool wasRunning = running;
             stopLocked();
+            band->closeEvents();
             bands.erase(std::find(bands.begin(), bands.end(), band));
             assignBands();
             saveBands();
@@ -682,14 +791,82 @@ namespace web {
             for (auto key : { "fftHoldSpeed", "fftSmoothingSpeed" }) {
                 if (d.contains(key)) { config.conf[key] = std::max<int>(1, d[key].get<int>()); }
             }
+            if (d.contains("fftMode")) {
+                std::string mode = d["fftMode"].get<std::string>();
+                if (mode != "line" && mode != "persistence") { throw std::runtime_error("Unknown FFT mode"); }
+                config.conf["fftMode"] = mode;
+            }
+            if (d.contains("persistenceSpeed")) { config.conf["persistenceSpeed"] = std::clamp<int>(d["persistenceSpeed"].get<int>(), 1, 100); }
             for (auto key : { "colorMap", "theme" }) {
                 if (d.contains(key)) { config.conf[key] = d[key].get<std::string>(); }
             }
             for (auto key : { "min", "max" }) {
                 if (d.contains(key)) { config.conf[key] = std::clamp<double>(d[key].get<double>(), -160.0, 0.0); }
             }
-            for (auto& b : bands) { applyBandDisplay(*b); }
+            DetectorSettings detection = detectorSettings();
+            for (auto& b : bands) {
+                applyBandDisplay(*b);
+                b->setDetection(detection);
+            }
             saveConfig();
+        }
+
+        json getInterference() {
+            std::lock_guard<std::recursive_mutex> lck(mtx);
+            json out;
+            out["settings"] = config.conf["interference"];
+            out["logFile"] = logPath();
+            out["bands"] = json::array();
+            out["active"] = json::array();
+            for (auto& b : bands) {
+                std::vector<InterferenceEvent> active;
+                DetectorStatus st;
+                b->detection(active, st);
+                out["bands"].push_back({ { "id", b->id },
+                                         { "enabled", st.enabled },
+                                         { "learning", st.learning },
+                                         { "learnProgress", st.learnProgress },
+                                         { "noiseFloor", st.noiseFloorDb },
+                                         { "baselineFloor", st.baselineFloorDb },
+                                         { "active", st.active } });
+                for (auto& e : active) { out["active"].push_back(eventJson(e)); }
+            }
+            std::lock_guard<std::mutex> elck(eventsMtx);
+            out["history"] = json(std::vector<json>(history.rbegin(), history.rend()));
+            return out;
+        }
+
+        void setInterference(const json& d) {
+            std::lock_guard<std::recursive_mutex> lck(mtx);
+            json& conf = config.conf["interference"];
+            if (d.contains("enabled")) { conf["enabled"] = d["enabled"].get<bool>(); }
+            auto number = [&](const char* key, double lo, double hi, const char* what) {
+                if (!d.contains(key)) { return; }
+                double v = d[key].get<double>();
+                if (v < lo || v > hi) { throw std::runtime_error(std::string(what) + " must be between " + std::to_string((int)lo) + " and " + std::to_string((int)hi)); }
+                conf[key] = v;
+            };
+            number("thresholdDb", 1, 60, "Threshold");
+            number("noiseRiseDb", 1, 40, "Noise rise");
+            number("learnSeconds", 1, 600, "Learn time");
+            number("adaptMinutes", 1, 120, "Adapt time");
+            saveConfig();
+            DetectorSettings detection = detectorSettings();
+            for (auto& b : bands) { b->setDetection(detection); }
+        }
+
+        void relearn(int band) {
+            std::lock_guard<std::recursive_mutex> lck(mtx);
+            if (band >= 0) {
+                findBand(band)->relearn();
+                return;
+            }
+            for (auto& b : bands) { b->relearn(); }
+        }
+
+        void clearHistory() {
+            std::lock_guard<std::mutex> lck(eventsMtx);
+            history.clear();
         }
 
         json getMenu(int radio, const json& action) {
