@@ -350,7 +350,7 @@ function syncPanes() {
 
 function showError() {
   const banner = $("error");
-  const message = !connected ? "Lost connection to sdrpp. Retrying..." : actionError || state?.error || "";
+  const message = !connected ? "Lost connection to the monitor. Retrying..." : actionError || state?.error || "";
   banner.hidden = message === "";
   banner.textContent = message;
 }

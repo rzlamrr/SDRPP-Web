@@ -152,12 +152,6 @@ body {
   display: block;
 }
 
-#logo {
-  width: 32px;
-  height: 32px;
-  flex: none;
-}
-
 #error {
   flex: none;
   padding: 5px 12px;
