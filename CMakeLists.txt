@@ -4,6 +4,7 @@ project(sdrpp)
 # Backends
 option(OPT_BACKEND_GLFW "Use the GLFW backend" ON)
 option(OPT_BACKEND_ANDROID "Use the Android backend" OFF)
+option(OPT_BUILD_WEB_MONITOR "Build the multi-band web monitor mode (sdrpp --web)" ON)
 
 # Compatibility Options
 option(OPT_OVERRIDE_STD_FILESYSTEM "Use a local version of std::filesystem on systems that don't have it yet" OFF)
@@ -349,6 +350,13 @@ else ()
 endif ()
 
 target_link_libraries(sdrpp PRIVATE sdrpp_core)
+
+# Multi-band web monitor (sdrpp --web)
+if (OPT_BUILD_WEB_MONITOR)
+    add_subdirectory("web")
+    target_link_libraries(sdrpp PRIVATE sdrpp_web)
+    target_compile_definitions(sdrpp PRIVATE SDRPP_WEB_MONITOR)
+endif (OPT_BUILD_WEB_MONITOR)
 
 # Compiler arguments
 target_compile_options(sdrpp PRIVATE ${SDRPP_COMPILER_FLAGS})

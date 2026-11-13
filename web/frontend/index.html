@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>SDR++ Web Monitor</title>
+    <link rel="icon" href="res/icons/sdrpp.png" />
+  </head>
+  <body>
+    <div id="app">
+      <div id="topbar">
+        <button id="menuBtn" class="icon-btn" title="Show or hide the menu"><img src="res/icons/menu.png" alt="Menu" /></button>
+        <button id="playBtn" class="icon-btn" title="Start or stop the radios"><img id="playIcon" src="res/icons/play.png" alt="Start" /></button>
+        <div id="freqSelect"></div>
+        <div id="bandLabel"></div>
+        <div id="topSpacer"></div>
+        <div id="snr" title="Signal to noise ratio of the selected band"><canvas id="snrCanvas"></canvas></div>
+        <img id="logo" src="res/icons/sdrpp.png" alt="SDR++" />
+      </div>
+      <div id="error" hidden></div>
+      <div id="main">
+        <div id="menu"></div>
+        <div id="menuResize"></div>
+        <div id="panes"></div>
+        <div id="controls">
+          <div class="vctl"><div class="vlabel">Zoom</div><div id="zoomSlider" class="vslider"></div></div>
+          <div class="vctl"><div class="vlabel">Max</div><div id="maxSlider" class="vslider"></div></div>
+          <div class="vctl"><div class="vlabel">Min</div><div id="minSlider" class="vslider"></div></div>
+        </div>
+      </div>
+    </div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

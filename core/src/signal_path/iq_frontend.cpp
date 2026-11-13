@@ -301,7 +301,7 @@ void IQFrontEnd::updateFFTPath(bool updateWaterfall) {
     dsp::buffer::clear(fftInBuf, _fftSize - _nzFFTSize, _nzFFTSize);
 
     // Update waterfall (TODO: This is annoying, it makes this module non testable and will constantly clear the waterfall for any reason)
-    if (updateWaterfall) { gui::waterfall.setRawFFTSize(_fftSize); }
+    if (updateWaterfall && !core::args["web"].b() && !core::args["server"].b()) { gui::waterfall.setRawFFTSize(_fftSize); }
 
     // Restart branch
     reshape.tempStart();

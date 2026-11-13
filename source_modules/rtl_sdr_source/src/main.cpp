@@ -19,10 +19,14 @@ SDRPP_MOD_INFO{
     /* Description:     */ "RTL-SDR source module for SDR++",
     /* Author:          */ "Ryzerth",
     /* Version:         */ 0, 1, 0,
-    /* Max instances    */ 1
+    /* Max instances    */ 8
 };
 
 ConfigManager config;
+
+// Name of the instance SDR++ creates by default. It keeps the original source name and
+// config key, additional instances (web monitor, one per radio) get their own.
+#define DEFAULT_INSTANCE_NAME "RTL-SDR Source"
 
 const double sampleRates[] = {
     250000,
@@ -59,7 +63,8 @@ public:
     RTLSDRSourceModule(std::string name) {
         this->name = name;
 
-        serverMode = (bool)core::args["server"];
+        // Both headless modes must draw through SmGui only, there is no ImGui context
+        serverMode = (bool)core::args["server"] || (bool)core::args["web"];
 
         sampleRate = sampleRates[0];
 
@@ -81,23 +86,54 @@ public:
 
         refresh();
 
-        config.acquire();
-        if (!config.conf["device"].is_string()) {
-            selectedDevName = "";
-            config.conf["device"] = "";
+        selectedDevName = loadSavedDevice();
+        if (selectedDevName.empty() && !isDefaultInstance() && instanceIndex() < (int)devNames.size()) {
+            // First run of an additional instance: take the next device instead of the first one
+            selectedDevName = devNames[instanceIndex()];
         }
-        else {
-            selectedDevName = config.conf["device"];
-        }
-        config.release(true);
         selectByName(selectedDevName);
 
-        sigpath::sourceManager.registerSource("RTL-SDR", &handler);
+        sourceName = isDefaultInstance() ? "RTL-SDR" : name;
+        sigpath::sourceManager.registerSource(sourceName, &handler);
     }
 
     ~RTLSDRSourceModule() {
         stop(this);
-        sigpath::sourceManager.unregisterSource("RTL-SDR");
+        sigpath::sourceManager.unregisterSource(sourceName);
+    }
+
+    bool isDefaultInstance() {
+        return name == DEFAULT_INSTANCE_NAME;
+    }
+
+    // Zero based index taken from a "... #N" instance name, 0 if there is none
+    int instanceIndex() {
+        size_t pos = name.rfind('#');
+        if (pos == std::string::npos) { return 0; }
+        int n = atoi(name.c_str() + pos + 1);
+        return (n > 0) ? (n - 1) : 0;
+    }
+
+    std::string loadSavedDevice() {
+        std::string devName = "";
+        config.acquire();
+        if (isDefaultInstance()) {
+            if (config.conf["device"].is_string()) { devName = config.conf["device"]; }
+            else { config.conf["device"] = ""; }
+        }
+        else if (config.conf.contains("instances") && config.conf["instances"].contains(name) &&
+                 config.conf["instances"][name]["device"].is_string()) {
+            devName = config.conf["instances"][name]["device"];
+        }
+        config.release(true);
+        return devName;
+    }
+
+    void saveDevice() {
+        config.acquire();
+        if (isDefaultInstance()) { config.conf["device"] = selectedDevName; }
+        else { config.conf["instances"][name]["device"] = selectedDevName; }
+        config.release(true);
     }
 
     void postInit() {}
@@ -372,9 +408,7 @@ private:
             _this->selectById(_this->devId);
             core::setInputSampleRate(_this->sampleRate);
             if (_this->selectedDevName != "") {
-                config.acquire();
-                config.conf["device"] = _this->selectedDevName;
-                config.release(true);
+                _this->saveDevice();
             }
         }
 
@@ -547,6 +581,7 @@ private:
     }
 
     std::string name;
+    std::string sourceName;
     rtlsdr_dev_t* openDev;
     bool enabled = true;
     dsp::stream<dsp::complex_t> stream;

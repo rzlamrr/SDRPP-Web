@@ -37,10 +37,18 @@ namespace core {
     ModuleManager moduleManager;
     ModuleComManager modComManager;
     CommandArgsParser args;
+    int (*webEntry)() = NULL;
+    void (*webSampleRateHandler)(double samplerate) = NULL;
 
     void setInputSampleRate(double samplerate) {
         // Forward this to the server
         if (args["server"].b()) { server::setInputSampleRate(samplerate); return; }
+
+        // Forward this to the web monitor
+        if (args["web"].b()) {
+            if (webSampleRateHandler) { webSampleRateHandler(samplerate); }
+            return;
+        }
         
         // Update IQ frontend input samplerate and get effective samplerate
         sigpath::iqFrontEnd.setSampleRate(samplerate);
@@ -78,10 +86,11 @@ int sdrpp_main(int argc, char* argv[]) {
     }
 
     bool serverMode = (bool)core::args["server"];
+    bool webMode = (bool)core::args["web"];
 
 #ifdef _WIN32
     // Free console if the user hasn't asked for a console and not in server mode
-    if (!core::args["con"].b() && !serverMode) { FreeConsole(); }
+    if (!core::args["con"].b() && !serverMode && !webMode) { FreeConsole(); }
 
     // Set error mode to avoid abnoxious popups
     SetErrorMode(SEM_NOOPENFILEERRORBOX | SEM_NOGPFAULTERRORBOX | SEM_FAILCRITICALERRORS);
@@ -359,6 +368,14 @@ int sdrpp_main(int argc, char* argv[]) {
     core::configManager.release(true);
 
     if (serverMode) { return server::main(); }
+
+    if (webMode) {
+        if (!core::webEntry) {
+            flog::error("This build does not include the web monitor");
+            return -1;
+        }
+        return core::webEntry();
+    }
 
     core::configManager.acquire();
     std::string resDir = core::configManager.conf["resourcesDirectory"];

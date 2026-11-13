@@ -39,6 +39,9 @@ public:
 
     std::vector<std::string> getSourceNames();
 
+    // Direct access to a registered source, used by the web monitor to run several sources at once
+    SourceHandler* getHandler(std::string name);
+
     Event<std::string> onSourceRegistered;
     Event<std::string> onSourceUnregister;
     Event<std::string> onSourceUnregistered;

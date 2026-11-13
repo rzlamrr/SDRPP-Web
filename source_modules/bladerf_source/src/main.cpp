@@ -10,6 +10,9 @@
 #include <libbladeRF.h>
 #include <gui/smgui.h>
 #include <algorithm>
+#include <chrono>
+#include <map>
+#include <string.h>
 #include <utils/optionlist.h>
 
 #define CONCAT(a, b) ((std::string(a) + b).c_str())
@@ -17,15 +20,24 @@
 #define NUM_BUFFERS   128
 #define NUM_TRANSFERS 1
 
+// Quick retune (band hopping): number of profiles kept per device and how long they stay valid.
+// libbladeRF notes that the stored tuning parameters drift with temperature.
+#define MAX_QUICK_TUNES        8
+#define QUICK_TUNE_LIFETIME_S  300
+
 SDRPP_MOD_INFO{
     /* Name:            */ "bladerf_source",
     /* Description:     */ "BladeRF source module for SDR++",
     /* Author:          */ "Ryzerth",
     /* Version:         */ 0, 1, 0,
-    /* Max instances    */ 1
+    /* Max instances    */ 8
 };
 
 ConfigManager config;
+
+// Name of the instance SDR++ creates by default. It keeps the original source name and
+// config key, additional instances (web monitor, one per radio) get their own.
+#define DEFAULT_INSTANCE_NAME "BladeRF Source"
 
 enum BladeRFType {
     BLADERF_TYPE_UNKNOWN,
@@ -56,17 +68,53 @@ public:
         refresh();
 
         // Select device here
-        config.acquire();
-        std::string serial = config.conf["device"];
-        config.release();
+        std::string serial = loadSavedDevice();
+        if (serial.empty() && !isDefaultInstance() && instanceIndex() < devCount) {
+            // First run of an additional instance: take the next device instead of the first one
+            serial = devInfoList[instanceIndex()].serial;
+        }
         selectBySerial(serial);
 
-        sigpath::sourceManager.registerSource("BladeRF", &handler);
+        sourceName = isDefaultInstance() ? "BladeRF" : name;
+        sigpath::sourceManager.registerSource(sourceName, &handler);
     }
 
     ~BladeRFSourceModule() {
         stop(this);
-        sigpath::sourceManager.unregisterSource("BladeRF");
+        sigpath::sourceManager.unregisterSource(sourceName);
+    }
+
+    bool isDefaultInstance() {
+        return name == DEFAULT_INSTANCE_NAME;
+    }
+
+    // Zero based index taken from a "... #N" instance name, 0 if there is none
+    int instanceIndex() {
+        size_t pos = name.rfind('#');
+        if (pos == std::string::npos) { return 0; }
+        int n = atoi(name.c_str() + pos + 1);
+        return (n > 0) ? (n - 1) : 0;
+    }
+
+    std::string loadSavedDevice() {
+        std::string serial = "";
+        config.acquire();
+        if (isDefaultInstance()) {
+            if (config.conf["device"].is_string()) { serial = config.conf["device"]; }
+        }
+        else if (config.conf.contains("instances") && config.conf["instances"].contains(name) &&
+                 config.conf["instances"][name]["device"].is_string()) {
+            serial = config.conf["instances"][name]["device"];
+        }
+        config.release();
+        return serial;
+    }
+
+    void saveDevice() {
+        config.acquire();
+        if (isDefaultInstance()) { config.conf["device"] = selectedSerial; }
+        else { config.conf["instances"][name]["device"] = selectedSerial; }
+        config.release(true);
     }
 
     void postInit() {}
@@ -125,8 +173,18 @@ public:
         selectFirst();
     }
 
+    // Opens a device by serial number alone. The instance number and USB address in a stored
+    // devinfo change as soon as another bladeRF is opened by this program, so they must not be matched.
+    int openBySerial(const char* serial) {
+        bladerf_devinfo any;
+        bladerf_init_devinfo(&any);
+        strncpy(any.serial, serial, sizeof(any.serial) - 1);
+        any.serial[sizeof(any.serial) - 1] = 0;
+        return bladerf_open_with_devinfo(&openDev, &any);
+    }
+
     void selectByInfo(bladerf_devinfo* info, bool reloadChannelId = true) {
-        int ret = bladerf_open_with_devinfo(&openDev, info);
+        int ret = openBySerial(info->serial);
         if (ret != 0) {
             flog::error("Could not open device {0}", info->serial);
             selectedSerial = "";
@@ -365,11 +423,17 @@ private:
 
         // Open device
         bladerf_devinfo info = _this->devInfoList[_this->devId];
-        int ret = bladerf_open_with_devinfo(&_this->openDev, &info);
+        int ret = _this->openBySerial(info.serial);
         if (ret != 0) {
             flog::error("Could not open device {0}", info.serial);
             return;
         }
+
+        // Quick retune profiles belong to the device session
+        _this->quickTunes.clear();
+        _this->tuneCounts.clear();
+        _this->quickTuneBroken = false;
+        _this->quickTunesBorn = std::chrono::steady_clock::now();
 
         // Calculate buffer size, must be a multiple of 1024
         _this->bufferSize = _this->sampleRate / 200.0;
@@ -433,9 +497,45 @@ private:
         BladeRFSourceModule* _this = (BladeRFSourceModule*)ctx;
         _this->freq = freq;
         if (_this->running) {
-            bladerf_set_frequency(_this->openDev, BLADERF_CHANNEL_RX(_this->chanId), _this->freq);
+            _this->retune();
         }
-        flog::info("BladeRFSourceModule '{0}': Tune: {1}!", _this->name, freq);
+    }
+
+    // Tunes to freq. A frequency that keeps coming back (a monitor visiting several bands in turn)
+    // gets a quick retune profile, which skips the slow tuning algorithm from then on.
+    void retune() {
+        bladerf_channel ch = BLADERF_CHANNEL_RX(chanId);
+        uint64_t f = (uint64_t)freq;
+
+        auto now = std::chrono::steady_clock::now();
+        if (now - quickTunesBorn > std::chrono::seconds(QUICK_TUNE_LIFETIME_S)) {
+            quickTunes.clear();
+            quickTunesBorn = now;
+        }
+
+        auto qt = quickTunes.find(f);
+        if (qt != quickTunes.end()) {
+            if (bladerf_schedule_retune(openDev, ch, BLADERF_RETUNE_NOW, 0, &qt->second) == 0) {
+                quickRetunes++;
+                return;
+            }
+            flog::warn("BladeRFSourceModule '{0}': quick retune failed, using normal tuning", name);
+            quickTunes.clear();
+            quickTuneBroken = true;
+        }
+
+        bladerf_set_frequency(openDev, ch, f);
+
+        // Manual tuning produces many frequencies that are used once, those get no profile
+        if (tuneCounts.size() > 256) { tuneCounts.clear(); }
+        int count = ++tuneCounts[f];
+        if (count >= 2 && !quickTuneBroken && quickTunes.size() < MAX_QUICK_TUNES) {
+            bladerf_quick_tune profile;
+            if (bladerf_get_quick_tune(openDev, ch, &profile) == 0) {
+                quickTunes[f] = profile;
+                flog::info("BladeRFSourceModule '{0}': quick retune profile stored for {1} Hz", name, freq);
+            }
+        }
     }
 
     static void menuHandler(void* ctx) {
@@ -449,9 +549,7 @@ private:
             bladerf_devinfo info = _this->devInfoList[_this->devId];
             _this->selectByInfo(&info);
             core::setInputSampleRate(_this->sampleRate);
-            config.acquire();
-            config.conf["device"] = _this->selectedSerial;
-            config.release(true);
+            _this->saveDevice();
         }
 
         if (SmGui::Combo(CONCAT("##_balderf_sr_sel_", _this->name), &_this->srId, _this->sampleRatesTxt.c_str())) {
@@ -592,6 +690,7 @@ private:
     }
 
     std::string name;
+    std::string sourceName;
     bladerf* openDev;
     bool enabled = true;
     dsp::stream<dsp::complex_t> stream;
@@ -633,6 +732,12 @@ private:
     std::string devListTxt;
 
     std::string selectedSerial;
+
+    std::map<uint64_t, bladerf_quick_tune> quickTunes;
+    std::map<uint64_t, int> tuneCounts;
+    std::chrono::steady_clock::time_point quickTunesBorn;
+    bool quickTuneBroken = false;
+    uint64_t quickRetunes = 0;
 
     BladeRFType selectedBladeType = BLADERF_TYPE_UNKNOWN;
 

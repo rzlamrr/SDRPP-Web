@@ -1,0 +1,460 @@
+/* Look of the SDR++ main window. Colors come from the SDR++ theme files as CSS variables (theme.ts). */
+
+:root {
+  --Text: #ffffffff;
+  --TextDisabled: #7f7f7fff;
+  --WindowBg: #0f0f0fef;
+  --FrameBg: #33353889;
+  --FrameBgHovered: #33353889;
+  --Button: #70707066;
+  --ButtonHovered: #70707072;
+  --ButtonActive: #70707066;
+  --Header: #a0a0b24f;
+  --HeaderHovered: #a0a0b266;
+  --CheckMark: #3d84e0ff;
+  --SliderGrab: #3d84e0ff;
+  --SliderGrabActive: #4296f9ff;
+  --Separator: #6d6d7f7f;
+  --Border: #6d6d7f7f;
+  --ClearColor: #111111ff;
+  --WaterfallBackground: #000000ff;
+  --PopupBg: #141414ef;
+  --menu-width: 300px;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  background: var(--ClearColor);
+  color: var(--Text);
+  font: 15px Roboto, "Segoe UI", sans-serif;
+  overflow: hidden;
+  user-select: none;
+}
+
+#app {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  background: var(--WindowBg);
+}
+
+/* --- top bar --- */
+
+#topbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  height: 50px;
+  padding: 4px 8px;
+  flex: none;
+}
+
+.icon-btn {
+  width: 40px;
+  height: 40px;
+  padding: 5px;
+  border: 0;
+  background: transparent;
+  cursor: pointer;
+  flex: none;
+}
+
+.icon-btn:hover {
+  background: var(--ButtonHovered);
+}
+
+.icon-btn img {
+  width: 30px;
+  height: 30px;
+  display: block;
+}
+
+.light-icons .icon-btn img {
+  filter: invert(1);
+}
+
+.freq-select {
+  display: flex;
+  align-items: center;
+  font-size: 38px;
+  line-height: 42px;
+  font-variant-numeric: tabular-nums;
+  margin-left: 6px;
+  flex: none;
+}
+
+.freq-digit {
+  position: relative;
+  display: inline-block;
+  width: 0.58em;
+  text-align: center;
+  cursor: pointer;
+}
+
+.freq-half {
+  position: absolute;
+  left: 0;
+  right: 0;
+  height: 50%;
+}
+
+.freq-up {
+  top: 0;
+}
+
+.freq-down {
+  bottom: 0;
+}
+
+.freq-half:hover {
+  background: rgba(255, 255, 0, 0.25);
+}
+
+.freq-dot {
+  width: 0.28em;
+  text-align: center;
+}
+
+.freq-select .dim {
+  color: var(--TextDisabled);
+}
+
+#bandLabel {
+  color: var(--TextDisabled);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;
+}
+
+#topSpacer {
+  flex: 1;
+}
+
+#snr {
+  width: 260px;
+  height: 38px;
+  flex: none;
+}
+
+#snrCanvas {
+  width: 100%;
+  height: 100%;
+  display: block;
+}
+
+#logo {
+  width: 32px;
+  height: 32px;
+  flex: none;
+}
+
+#error {
+  flex: none;
+  padding: 5px 12px;
+  background: #7a1f1f;
+  color: #fff;
+}
+
+/* --- layout --- */
+
+#main {
+  display: flex;
+  flex: 1;
+  min-height: 0;
+}
+
+#menu {
+  width: var(--menu-width);
+  flex: none;
+  overflow-y: auto;
+  padding: 0 4px 8px 8px;
+  scrollbar-width: thin;
+  scrollbar-color: var(--ScrollbarGrab, #4f4f4f) transparent;
+}
+
+#menuResize {
+  width: 5px;
+  flex: none;
+  cursor: ew-resize;
+  border-left: 1px solid var(--Separator);
+}
+
+#menuResize:hover {
+  border-left-color: var(--SliderGrab);
+}
+
+.menu-hidden #menu,
+.menu-hidden #menuResize {
+  display: none;
+}
+
+#panes {
+  flex: 1;
+  min-width: 0;
+  display: grid;
+  gap: 4px;
+  padding: 0 0 4px 4px;
+}
+
+#panes.empty::after {
+  content: "No bands. Add one in the Bands menu.";
+  color: var(--TextDisabled);
+  place-self: center;
+}
+
+.pane {
+  position: relative;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+  background: var(--WaterfallBackground);
+  border: 1px solid rgb(50, 50, 50);
+}
+
+.pane.selected {
+  border-color: var(--SliderGrab);
+}
+
+.pane-canvas {
+  position: absolute;
+  inset: 0;
+  touch-action: none;
+}
+
+.pane-waterfall {
+  position: absolute;
+  image-rendering: pixelated;
+  pointer-events: none;
+}
+
+#controls {
+  width: 62px;
+  flex: none;
+  display: flex;
+  flex-direction: column;
+  padding: 0 8px 8px;
+}
+
+.vctl {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+}
+
+.vlabel {
+  padding: 6px 0 4px;
+}
+
+.im-vslider {
+  position: relative;
+  flex: 1;
+  width: 20px;
+  min-height: 30px;
+  background: var(--FrameBg);
+  cursor: pointer;
+  touch-action: none;
+}
+
+.im-vgrab {
+  position: absolute;
+  left: 2px;
+  right: 2px;
+  height: 14px;
+  background: var(--SliderGrab);
+}
+
+/* --- ImGui style widgets --- */
+
+.im-section {
+  margin-top: 4px;
+}
+
+.im-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  height: 24px;
+  padding: 0 6px;
+  background: var(--Header);
+  cursor: pointer;
+}
+
+.im-header:hover {
+  background: var(--HeaderHovered);
+}
+
+.im-arrow {
+  font-size: 10px;
+  width: 12px;
+}
+
+.im-section-body {
+  padding: 4px 0 4px 2px;
+}
+
+.im-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 24px;
+  margin: 4px 0;
+}
+
+.im-fill {
+  flex: 1;
+  min-width: 0;
+}
+
+.im-left-label {
+  flex: none;
+  white-space: nowrap;
+}
+
+.im-text {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.im-disabled-text,
+.band-radio {
+  color: var(--TextDisabled);
+}
+
+.im-separator-text {
+  margin: 8px 0 2px;
+  padding-bottom: 2px;
+  border-bottom: 1px solid var(--Separator);
+  color: var(--TextDisabled);
+}
+
+.im-disabled {
+  opacity: 0.5;
+  pointer-events: none;
+}
+
+.im-button,
+.im-combo,
+.im-input {
+  height: 24px;
+  border: 0;
+  color: var(--Text);
+  font: inherit;
+}
+
+.im-button {
+  padding: 0 8px;
+  background: var(--Button);
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.im-button:hover {
+  background: var(--ButtonHovered);
+}
+
+.im-combo {
+  background: var(--FrameBg);
+  padding: 0 4px;
+  cursor: pointer;
+}
+
+.im-combo option {
+  background: #1c1c1c;
+  color: #fff;
+}
+
+.im-input {
+  background: var(--FrameBg);
+  padding: 0 6px;
+  width: 100%;
+  min-width: 0;
+  user-select: text;
+}
+
+.im-input:focus,
+.im-combo:focus {
+  outline: 1px solid var(--SliderGrab);
+}
+
+.im-inputint {
+  display: flex;
+  gap: 3px;
+}
+
+.im-inputint .im-button {
+  width: 24px;
+  padding: 0;
+  flex: none;
+}
+
+.im-checkbox {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  cursor: pointer;
+}
+
+.im-checkbox input {
+  position: absolute;
+  opacity: 0;
+  pointer-events: none;
+}
+
+.im-check {
+  width: 20px;
+  height: 20px;
+  background: var(--FrameBg);
+  flex: none;
+  position: relative;
+}
+
+.im-checkbox input:checked + .im-check::after {
+  content: "";
+  position: absolute;
+  inset: 4px;
+  background: var(--CheckMark);
+}
+
+.im-radio .im-check,
+.im-radio input:checked + .im-check::after {
+  border-radius: 50%;
+}
+
+.im-slider {
+  position: relative;
+  height: 24px;
+  min-width: 60px;
+  background: var(--FrameBg);
+  cursor: pointer;
+  touch-action: none;
+}
+
+.im-grab {
+  position: absolute;
+  top: 2px;
+  bottom: 2px;
+  width: 12px;
+  background: var(--SliderGrab);
+}
+
+.im-slider-value {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  pointer-events: none;
+}

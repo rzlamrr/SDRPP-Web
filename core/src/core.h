@@ -10,6 +10,11 @@ namespace core {
     SDRPP_EXPORT ModuleComManager modComManager;
     SDRPP_EXPORT CommandArgsParser args;
 
+    // Web monitor mode (--web). The executable sets webEntry before calling sdrpp_main.
+    // webSampleRateHandler receives the sample rate reported by the source being configured.
+    SDRPP_EXPORT int (*webEntry)();
+    SDRPP_EXPORT void (*webSampleRateHandler)(double samplerate);
+
     void setInputSampleRate(double samplerate);
 };
 

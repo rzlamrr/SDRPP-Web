@@ -1,0 +1,500 @@
+#include "engine.h"
+#include "radio.h"
+#include <core.h>
+#include <config.h>
+#include <gui/smgui.h>
+#include <utils/flog.h>
+#include <algorithm>
+#include <filesystem>
+#include <fstream>
+#include <memory>
+#include <vector>
+#include <mutex>
+#include <stdexcept>
+
+using nlohmann::json;
+
+namespace web {
+    namespace engine {
+        namespace {
+            struct SourceType {
+                std::string id;
+                std::string name;         // Name the default instance registers in the source manager
+                std::string module;
+                std::string instanceName; // Name of the instance desktop SDR++ creates
+                int settleMs;             // Time the tuner needs after a retune
+            };
+
+            const std::vector<SourceType> sourceTypes = {
+                { "bladerf", "BladeRF", "bladerf_source", "BladeRF Source", 15 },
+                { "rtlsdr", "RTL-SDR", "rtl_sdr_source", "RTL-SDR Source", 60 },
+            };
+
+            const int MAX_RADIOS = 8;
+            const int MAX_BANDS = 16;
+            const std::vector<int> fftSizes = { 524288, 262144, 131072, 65536, 32768, 16384, 8192, 4096, 2048, 1024 };
+
+            // Guards everything below. Recursive because source modules call back into
+            // onSampleRate while we are inside their menu or select handlers.
+            std::recursive_mutex mtx;
+            ConfigManager config;
+            std::function<void(const std::string&)> frameHandler;
+            std::mutex frameHandlerMtx;
+
+            std::vector<std::unique_ptr<Radio>> radios;
+            std::vector<std::shared_ptr<Band>> bands;
+            Radio* activeRadio = NULL;
+            bool running = false;
+            std::string lastError;
+
+            const SourceType& sourceType() {
+                std::string id = config.conf["sourceType"].get<std::string>();
+                for (auto& t : sourceTypes) {
+                    if (t.id == id) { return t; }
+                }
+                return sourceTypes[0];
+            }
+
+            // The config is only touched under mtx, so it is written out directly instead of auto-saved
+            void saveConfig() {
+                config.save();
+            }
+
+            void onSampleRate(double sampleRate) {
+                std::lock_guard<std::recursive_mutex> lck(mtx);
+                if (activeRadio) { activeRadio->setSampleRate(sampleRate); }
+            }
+
+            float holdSpeed() {
+                return config.conf["fftHoldSpeed"].get<float>() / (config.conf["fftRate"].get<float>() * 10.0f);
+            }
+
+            float smoothingSpeed() {
+                return std::min<float>(config.conf["fftSmoothingSpeed"].get<float>() / (config.conf["fftRate"].get<float>() * 10.0f), 1.0f);
+            }
+
+            void applyBandDisplay(Band& band) {
+                band.setFFTHold(config.conf["fftHold"].get<bool>(), holdSpeed());
+                band.setFFTSmoothing(config.conf["fftSmoothing"].get<bool>(), smoothingSpeed());
+            }
+
+            std::shared_ptr<Band> findBand(int id) {
+                for (auto& b : bands) {
+                    if (b->id == id) { return b; }
+                }
+                throw std::runtime_error("Band not found");
+            }
+
+            Radio* radioOf(const std::shared_ptr<Band>& band) {
+                for (auto& r : radios) {
+                    if (std::find(r->bands.begin(), r->bands.end(), band) != r->bands.end()) { return r.get(); }
+                }
+                return NULL;
+            }
+
+            void saveBands() {
+                json list = json::array();
+                for (auto& b : bands) {
+                    list.push_back({ { "id", b->id }, { "name", b->name }, { "frequency", b->frequency } });
+                }
+                config.conf["bands"] = list;
+                saveConfig();
+            }
+
+            // Spread the bands over the radios, in order
+            void assignBands() {
+                std::vector<std::vector<std::shared_ptr<Band>>> groups(radios.size());
+                if (!radios.empty()) {
+                    for (size_t i = 0; i < bands.size(); i++) {
+                        groups[i % radios.size()].push_back(bands[i]);
+                    }
+                }
+                for (size_t i = 0; i < radios.size(); i++) {
+                    radios[i]->setBands(groups[i]);
+                }
+            }
+
+            void stopLocked() {
+                for (auto& r : radios) { r->stop(); }
+                running = false;
+            }
+
+            void startLocked() {
+                if (running) { return; }
+                if (bands.empty()) { throw std::runtime_error("Add a band first"); }
+                if (radios.empty()) { throw std::runtime_error("No radio available. Is the " + sourceType().name + " module built and in the modules directory?"); }
+                int dwellMs = config.conf["dwellMs"].get<int>();
+                int settleMs = config.conf["settleMs"].is_number() ? config.conf["settleMs"].get<int>() : sourceType().settleMs;
+                for (auto& r : radios) { r->start(dwellMs, settleMs); }
+                running = true;
+            }
+
+            // Create the module instances of the selected source type and one Radio for each
+            void buildRadios() {
+                stopLocked();
+                radios.clear();
+                lastError = "";
+
+                const SourceType& type = sourceType();
+                int count = std::clamp<int>(config.conf["radioCount"].get<int>(), 1, MAX_RADIOS);
+
+                if (core::moduleManager.modules.find(type.module) == core::moduleManager.modules.end()) {
+                    lastError = "The " + type.name + " source module is not loaded";
+                    flog::error("Web monitor: {0}", lastError);
+                    return;
+                }
+
+                for (int i = 0; i < count; i++) {
+                    std::string instanceName = (i == 0) ? type.instanceName : (type.instanceName + " #" + std::to_string(i + 1));
+                    std::string sourceName = (i == 0) ? type.name : instanceName;
+
+                    if (core::moduleManager.instances.find(instanceName) == core::moduleManager.instances.end()) {
+                        flog::info("Web monitor: creating instance '{0}'", instanceName);
+                        if (core::moduleManager.createInstance(instanceName, type.module) < 0) { break; }
+                        core::moduleManager.postInit(instanceName);
+                    }
+
+                    SourceManager::SourceHandler* handler = sigpath::sourceManager.getHandler(sourceName);
+                    if (!handler) {
+                        flog::error("Web monitor: source '{0}' was not registered", sourceName);
+                        break;
+                    }
+
+                    auto radio = std::make_unique<Radio>(i, instanceName, sourceName, handler);
+                    radio->init(config.conf["fftSize"].get<int>(), config.conf["fftRate"].get<double>(), config.conf["fftWindow"].get<int>());
+
+                    // Selecting the source makes the module report its sample rate
+                    activeRadio = radio.get();
+                    handler->selectHandler(handler->ctx);
+                    activeRadio = NULL;
+
+                    radios.push_back(std::move(radio));
+                }
+                assignBands();
+            }
+
+            json listNames(const std::string& dir) {
+                json names = json::array();
+                std::error_code ec;
+                for (const auto& file : std::filesystem::directory_iterator(dir, ec)) {
+                    if (file.path().extension() != ".json") { continue; }
+                    try {
+                        std::ifstream f(file.path());
+                        json j = json::parse(f);
+                        names.push_back({ { "name", j.value("name", file.path().stem().string()) }, { "file", file.path().filename().string() } });
+                    }
+                    catch (const std::exception&) {}
+                }
+                return names;
+            }
+        }
+
+        void init() {
+            std::lock_guard<std::recursive_mutex> lck(mtx);
+
+            // Display defaults are the ones of desktop SDR++ (core.cpp)
+            json def = json({});
+            def["sourceType"] = "bladerf";
+            def["radioCount"] = 1;
+            def["dwellMs"] = 100;
+            def["settleMs"] = nullptr;
+            def["bands"] = json::array({ { { "id", 1 }, { "name", "Band 1" }, { "frequency", 100000000.0 } } });
+            def["fftSize"] = 65536;
+            def["fftRate"] = 20;
+            def["fftWindow"] = 2;
+            def["showWaterfall"] = true;
+            def["fftHold"] = false;
+            def["fftHoldSpeed"] = 60;
+            def["fftSmoothing"] = false;
+            def["fftSmoothingSpeed"] = 100;
+            def["colorMap"] = "Classic";
+            def["theme"] = "Dark";
+            def["min"] = -120.0;
+            def["max"] = 0.0;
+            config.setPath(core::args["root"].s() + "/web_config.json");
+            config.load(def);
+
+            // Keys added by newer versions
+            for (auto& [key, value] : def.items()) {
+                if (!config.conf.contains(key)) { config.conf[key] = value; }
+            }
+
+            for (auto& b : config.conf["bands"]) {
+                auto band = std::make_shared<Band>(b["id"].get<int>(), b["name"].get<std::string>(), b["frequency"].get<double>());
+                band->onFrame = [](const std::string& frame) {
+                    std::lock_guard<std::mutex> lck(frameHandlerMtx);
+                    if (frameHandler) { frameHandler(frame); }
+                };
+                applyBandDisplay(*band);
+                bands.push_back(band);
+            }
+
+            core::webSampleRateHandler = onSampleRate;
+            buildRadios();
+        }
+
+        void shutdown() {
+            std::lock_guard<std::recursive_mutex> lck(mtx);
+            stopLocked();
+            radios.clear();
+            config.save();
+        }
+
+        void setFrameHandler(std::function<void(const std::string&)> handler) {
+            std::lock_guard<std::mutex> lck(frameHandlerMtx);
+            frameHandler = handler;
+        }
+
+        std::string resourcesDirectory() {
+            core::configManager.acquire();
+            std::string dir = core::configManager.conf["resourcesDirectory"].get<std::string>();
+            core::configManager.release();
+            return std::filesystem::absolute(dir).string();
+        }
+
+        json getState() {
+            std::lock_guard<std::recursive_mutex> lck(mtx);
+            json state;
+            state["running"] = running;
+            state["sourceType"] = sourceType().id;
+            state["sourceTypes"] = json::array();
+            for (auto& t : sourceTypes) {
+                state["sourceTypes"].push_back({ { "id", t.id }, { "name", t.name } });
+            }
+            state["radioCount"] = config.conf["radioCount"];
+            state["dwellMs"] = config.conf["dwellMs"];
+            state["settleMs"] = config.conf["settleMs"].is_number() ? config.conf["settleMs"].get<int>() : sourceType().settleMs;
+
+            state["bands"] = json::array();
+            for (auto& b : bands) {
+                Radio* r = radioOf(b);
+                state["bands"].push_back({ { "id", b->id },
+                                           { "name", b->name },
+                                           { "frequency", b->frequency },
+                                           { "radio", r ? r->id : -1 },
+                                           { "sampleRate", r ? r->getSampleRate() : 0.0 } });
+            }
+
+            state["radios"] = json::array();
+            std::string error = lastError;
+            for (auto& r : radios) {
+                json ids = json::array();
+                for (auto& b : r->bands) { ids.push_back(b->id); }
+                bool receiving = r->isReceiving();
+                state["radios"].push_back({ { "id", r->id },
+                                            { "name", r->sourceName },
+                                            { "sampleRate", r->getSampleRate() },
+                                            { "bands", ids },
+                                            { "receiving", receiving } });
+                if (running && !r->bands.empty() && !receiving && !r->isStarting() && error.empty()) {
+                    error = "No data from radio " + std::to_string(r->id + 1) + " (" + r->sourceName + "). Check that the device is connected and selected in the Source menu.";
+                }
+            }
+            int wanted = config.conf["radioCount"].get<int>();
+            if ((int)radios.size() < wanted && error.empty()) {
+                error = "Only " + std::to_string(radios.size()) + " of " + std::to_string(wanted) + " radios could be set up";
+            }
+            state["error"] = error;
+
+            json display;
+            for (auto key : { "fftSize", "fftRate", "fftWindow", "showWaterfall", "fftHold", "fftHoldSpeed", "fftSmoothing", "fftSmoothingSpeed", "colorMap", "theme", "min", "max" }) {
+                display[key] = config.conf[key];
+            }
+            state["display"] = display;
+            state["fftSizes"] = fftSizes;
+
+            std::string res = resourcesDirectory();
+            state["colorMaps"] = listNames(res + "/colormaps");
+            state["themes"] = listNames(res + "/themes");
+            return state;
+        }
+
+        void start() {
+            std::lock_guard<std::recursive_mutex> lck(mtx);
+            startLocked();
+        }
+
+        void stop() {
+            std::lock_guard<std::recursive_mutex> lck(mtx);
+            stopLocked();
+        }
+
+        void setSetup(const json& setup) {
+            std::lock_guard<std::recursive_mutex> lck(mtx);
+            bool rebuild = false;
+
+            if (setup.contains("sourceType")) {
+                std::string id = setup["sourceType"].get<std::string>();
+                bool known = std::any_of(sourceTypes.begin(), sourceTypes.end(), [&](const SourceType& t) { return t.id == id; });
+                if (!known) { throw std::runtime_error("Unknown source type"); }
+                if (id != config.conf["sourceType"].get<std::string>()) {
+                    config.conf["sourceType"] = id;
+                    config.conf["settleMs"] = nullptr;
+                    rebuild = true;
+                }
+            }
+            if (setup.contains("radioCount")) {
+                int count = setup["radioCount"].get<int>();
+                if (count < 1 || count > MAX_RADIOS) { throw std::runtime_error("Radio count must be between 1 and " + std::to_string(MAX_RADIOS)); }
+                if (count != config.conf["radioCount"].get<int>()) {
+                    config.conf["radioCount"] = count;
+                    rebuild = true;
+                }
+            }
+            bool timing = false;
+            if (setup.contains("dwellMs")) {
+                int dwell = setup["dwellMs"].get<int>();
+                if (dwell < 10 || dwell > 10000) { throw std::runtime_error("Dwell time must be between 10 and 10000 ms"); }
+                timing = timing || (dwell != config.conf["dwellMs"].get<int>());
+                config.conf["dwellMs"] = dwell;
+            }
+            if (setup.contains("settleMs")) {
+                int settle = setup["settleMs"].get<int>();
+                if (settle < 0 || settle > 1000) { throw std::runtime_error("Settle time must be between 0 and 1000 ms"); }
+                timing = true;
+                config.conf["settleMs"] = settle;
+            }
+            saveConfig();
+
+            bool wasRunning = running;
+            if (rebuild) {
+                buildRadios();
+            }
+            else if (timing && wasRunning) {
+                stopLocked();
+            }
+            if (wasRunning && !running && (rebuild || timing)) { startLocked(); }
+        }
+
+        int addBand(const json& j) {
+            std::lock_guard<std::recursive_mutex> lck(mtx);
+            if ((int)bands.size() >= MAX_BANDS) { throw std::runtime_error("No more than " + std::to_string(MAX_BANDS) + " bands"); }
+            double frequency = j.value("frequency", 100000000.0);
+            if (frequency < 0) { throw std::runtime_error("Invalid frequency"); }
+
+            int id = 1;
+            for (auto& b : bands) { id = std::max<int>(id, b->id + 1); }
+            auto band = std::make_shared<Band>(id, j.value("name", "Band " + std::to_string(id)), frequency);
+            band->onFrame = [](const std::string& frame) {
+                std::lock_guard<std::mutex> lck(frameHandlerMtx);
+                if (frameHandler) { frameHandler(frame); }
+            };
+            applyBandDisplay(*band);
+
+            bool wasRunning = running;
+            stopLocked();
+            bands.push_back(band);
+            assignBands();
+            saveBands();
+            if (wasRunning) { startLocked(); }
+            return id;
+        }
+
+        void updateBand(int id, const json& j) {
+            std::lock_guard<std::recursive_mutex> lck(mtx);
+            auto band = findBand(id);
+            if (j.contains("name")) { band->name = j["name"].get<std::string>(); }
+            if (j.contains("frequency")) {
+                double frequency = j["frequency"].get<double>();
+                if (frequency < 0) { throw std::runtime_error("Invalid frequency"); }
+                band->frequency = frequency;
+                Radio* r = radioOf(band);
+                if (r) { r->retune(band); }
+            }
+            saveBands();
+        }
+
+        void removeBand(int id) {
+            std::lock_guard<std::recursive_mutex> lck(mtx);
+            auto band = findBand(id);
+            bool wasRunning = running;
+            stopLocked();
+            bands.erase(std::find(bands.begin(), bands.end(), band));
+            assignBands();
+            saveBands();
+            if (wasRunning && !bands.empty()) { startLocked(); }
+        }
+
+        void setView(int id, double offset, double bandwidth, int points) {
+            std::lock_guard<std::recursive_mutex> lck(mtx);
+            findBand(id)->setView(offset, bandwidth, points);
+        }
+
+        void setDisplay(const json& d) {
+            std::lock_guard<std::recursive_mutex> lck(mtx);
+
+            if (d.contains("fftSize")) {
+                int size = d["fftSize"].get<int>();
+                if (std::find(fftSizes.begin(), fftSizes.end(), size) == fftSizes.end()) { throw std::runtime_error("Unsupported FFT size"); }
+                config.conf["fftSize"] = size;
+                for (auto& r : radios) { r->setFFTSize(size); }
+            }
+            if (d.contains("fftRate")) {
+                int rate = std::clamp<int>(d["fftRate"].get<int>(), 1, 200);
+                config.conf["fftRate"] = rate;
+                for (auto& r : radios) { r->setFFTRate(rate); }
+            }
+            if (d.contains("fftWindow")) {
+                int window = std::clamp<int>(d["fftWindow"].get<int>(), 0, 2);
+                config.conf["fftWindow"] = window;
+                for (auto& r : radios) { r->setFFTWindow(window); }
+            }
+            for (auto key : { "showWaterfall", "fftHold", "fftSmoothing" }) {
+                if (d.contains(key)) { config.conf[key] = d[key].get<bool>(); }
+            }
+            for (auto key : { "fftHoldSpeed", "fftSmoothingSpeed" }) {
+                if (d.contains(key)) { config.conf[key] = std::max<int>(1, d[key].get<int>()); }
+            }
+            for (auto key : { "colorMap", "theme" }) {
+                if (d.contains(key)) { config.conf[key] = d[key].get<std::string>(); }
+            }
+            for (auto key : { "min", "max" }) {
+                if (d.contains(key)) { config.conf[key] = std::clamp<double>(d[key].get<double>(), -160.0, 0.0); }
+            }
+            for (auto& b : bands) { applyBandDisplay(*b); }
+            saveConfig();
+        }
+
+        json getMenu(int radio, const json& action) {
+            std::lock_guard<std::recursive_mutex> lck(mtx);
+            if (radio < 0 || radio >= (int)radios.size()) { throw std::runtime_error("Radio not found"); }
+            Radio* r = radios[radio].get();
+            activeRadio = r;
+
+            // Same sequence as server::renderUI: apply the action, then record the resulting menu
+            SmGui::DrawListElem none;
+            none.type = SmGui::DRAW_LIST_ELEM_TYPE_BOOL;
+            none.b = false;
+            if (!action.is_null()) {
+                SmGui::DrawListElem value = none;
+                std::string type = action.value("type", "void");
+                if (type == "bool") { value.type = SmGui::DRAW_LIST_ELEM_TYPE_BOOL; value.b = action["value"].get<bool>(); }
+                else if (type == "int") { value.type = SmGui::DRAW_LIST_ELEM_TYPE_INT; value.i = action["value"].get<int>(); }
+                else if (type == "float") { value.type = SmGui::DRAW_LIST_ELEM_TYPE_FLOAT; value.f = action["value"].get<float>(); }
+                else if (type == "string") { value.type = SmGui::DRAW_LIST_ELEM_TYPE_STRING; value.str = action["value"].get<std::string>(); }
+                SmGui::setDiff(action["id"].get<std::string>(), value);
+                r->handler->menuHandler(r->handler->ctx);
+            }
+
+            SmGui::DrawList dl;
+            SmGui::setDiff("", none);
+            SmGui::startRecord(&dl);
+            r->handler->menuHandler(r->handler->ctx);
+            SmGui::stopRecord();
+            activeRadio = NULL;
+
+            json elements = json::array();
+            for (auto& e : dl.elements) {
+                if (e.type == SmGui::DRAW_LIST_ELEM_TYPE_DRAW_STEP) { elements.push_back({ { "step", (int)e.step }, { "sync", e.forceSync } }); }
+                else if (e.type == SmGui::DRAW_LIST_ELEM_TYPE_BOOL) { elements.push_back({ { "v", e.b } }); }
+                else if (e.type == SmGui::DRAW_LIST_ELEM_TYPE_INT) { elements.push_back({ { "v", e.i } }); }
+                else if (e.type == SmGui::DRAW_LIST_ELEM_TYPE_FLOAT) { elements.push_back({ { "v", e.f } }); }
+                else {
+                    // Combo items are separated by NUL characters, which the browser splits on
+                    elements.push_back({ { "v", e.str } });
+                }
+            }
+            return { { "radio", radio }, { "name", r->sourceName }, { "running", r->isRunning() }, { "elements", elements } };
+        }
+    }
+}

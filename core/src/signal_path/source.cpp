@@ -39,6 +39,11 @@ std::vector<std::string> SourceManager::getSourceNames() {
     return names;
 }
 
+SourceManager::SourceHandler* SourceManager::getHandler(std::string name) {
+    auto it = sources.find(name);
+    return (it != sources.end()) ? it->second : NULL;
+}
+
 void SourceManager::selectSource(std::string name) {
     if (sources.find(name) == sources.end()) {
         flog::error("Tried to select non existent source: {0}", name);
